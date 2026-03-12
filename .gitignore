@@ -1,0 +1,34 @@
+# Virtual environment
+.venv/
+venv/
+
+.claude/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
+
+
+
+# Analysis output directories
+output/
+results/
+dumps/
+
+
+
+
+# Caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

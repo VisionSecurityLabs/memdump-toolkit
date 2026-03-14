@@ -138,7 +138,7 @@ MITRE ATT&CK is a **standardized catalog of attacker behaviors**, maintained by 
 
 ### Why memory-dumped hashes don't match on-disk files
 
-When you extract a DLL from a memory dump and hash it, the SHA-256 will **never** match the hash of the same DLL sitting on disk. This means you cannot look up memory-dumped hashes on VirusTotal, NSRL, or any other hash database and expect a match. This is not a bug — it is an inherent property of how Windows loads PE files into memory.
+When you extract a DLL from a memory dump and hash it, the SHA-256 will **never** match the hash of the same DLL sitting on disk. This means you cannot look up memory-dumped hashes on VirusTotal or any other on-disk hash database and expect a match. This is not a bug — it is an inherent property of how Windows loads PE files into memory.
 
 Three things change between the on-disk file and the in-memory image:
 
@@ -148,7 +148,7 @@ Three things change between the on-disk file and the in-memory image:
 
 3. **Page zeroing and partial paging**. The OS only pages in memory as it is accessed. Sections that were never touched may be **zeroed out** in the dump, while the on-disk file has real content there. Conversely, some pages may have been modified by runtime patches (hotpatching, hooks) that further change the content.
 
-**Practical implication:** The toolkit computes and reports hashes for every extracted binary (they are useful for correlating across multiple dumps of the same process), but these hashes are **memory-image hashes**, not file hashes. To match against known-good databases like NSRL, use the `--known-good` option with a hash set built from memory images of trusted binaries, or rely on the toolkit's other signals (imports, strings, sections, YARA) for identification.
+**Practical implication:** The toolkit computes and reports hashes for every extracted binary (they are useful for correlating across multiple dumps of the same process), but these hashes are **memory-image hashes**, not file hashes. To filter known-good binaries, use the `--known-good` option with a hash set built from memory images of trusted binaries, or rely on the toolkit's other signals (imports, strings, sections, YARA) for identification.
 
 ---
 

@@ -57,8 +57,7 @@ The headerless PE scanner finds binaries with zeroed MZ headers by locating sect
 
 Memory-dumped DLL hashes do not match their on-disk originals due to relocation, IAT patching, and page zeroing applied by the Windows loader. This means:
 
-- NSRL hashes cannot be used directly for known-good filtering
-- VirusTotal hash lookups will not match memory-dumped files
+- On-disk hash databases (VirusTotal, etc.) will not match memory-dumped files
 - The `--known-good` feature requires hashes computed from memory dumps of clean systems, not from on-disk files
 
 ---
@@ -96,7 +95,7 @@ Community rulesets (6 repositories, thousands of rule files) are compiled indivi
 
 ### Memory usage with large known-good sets
 
-The full NSRL hash set is ~2 GB of SHA-256 hashes. Loading this as a Python `set[str]` consumes significant RAM. For large hash sets, a bloom filter or SQLite-backed lookup would be more appropriate than in-memory storage.
+Large known-good hash sets (millions of entries) loaded as a Python `set[str]` consume significant RAM. For very large hash sets, a bloom filter or SQLite-backed lookup would be more appropriate than in-memory storage.
 
 ---
 

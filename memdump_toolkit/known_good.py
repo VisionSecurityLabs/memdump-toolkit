@@ -19,7 +19,7 @@ BUNDLED_HASHES_FILE = Path(__file__).parent / "data" / "known_good_hashes.txt"
 def load_hash_file(path: str | Path) -> set[str]:
     """Load SHA-256 hashes from a file (one hex digest per line).
 
-    Supports NSRL RDS format (SHA-256 in first column, comma-separated)
+    Supports CSV format (SHA-256 in first column, comma-separated)
     and plain text (one hash per line). Lines starting with # are skipped.
     """
     hashes: set[str] = set()

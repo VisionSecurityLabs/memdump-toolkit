@@ -504,7 +504,7 @@ def compute_risk_score(
         score += 10
         factors.append("embedded_network_iocs")
 
-    # Known-good (NSRL) hash match — strong de-prioritization
+    # Known-good hash match — strong de-prioritization
     sha = result.get("hashes", {}).get("sha256", "")
     if sha and known_good and sha.lower() in known_good:
         score = max(score - 50, 0)

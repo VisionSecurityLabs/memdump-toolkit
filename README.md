@@ -303,7 +303,7 @@ See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for a detailed breakdown of what 
 | "Failed to read module memory" | Dump truncated — toolkit falls back to page-by-page reading |
 | Slow on large dumps | Normal for >1 GB; dump is parsed once, modules are filtered by tier |
 | Too many false positives | System DLLs should score 0 — check if paths are in trusted list |
-| Hashes don't match VirusTotal/NSRL | **Expected.** Memory-dumped DLLs differ from on-disk originals due to relocation, IAT patching, and page zeroing. See [Architecture § Why memory-dumped hashes don't match](docs/ARCHITECTURE.md#why-memory-dumped-hashes-dont-match-on-disk-files). Use `--known-good` with memory-image hash sets instead. |
+| Hashes don't match VirusTotal | **Expected.** Memory-dumped DLLs differ from on-disk originals due to relocation, IAT patching, and page zeroing. See [Architecture § Why memory-dumped hashes don't match](docs/ARCHITECTURE.md#why-memory-dumped-hashes-dont-match-on-disk-files). Use `--known-good` with memory-image hash sets instead. |
 
 ## Acknowledgements
 

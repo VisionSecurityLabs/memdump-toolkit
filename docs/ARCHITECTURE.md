@@ -23,6 +23,7 @@ If you are new to memory forensics, think of a minidump as a photograph of a run
 11. [Detection Techniques We Could Borrow](#11-detection-techniques-we-could-borrow)
 12. [Module Dependency Graph](#12-module-dependency-graph)
 13. [Data Flow](#13-data-flow)
+14. [Known Limitations](LIMITATIONS.md)
 
 ---
 

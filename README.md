@@ -289,6 +289,10 @@ memdump-toolkit full dump.dmp --yara-rules ./my-custom-rules/
 | **eset** | ESET research publications |
 | **elastic** | Elastic threat research |
 
+## Known Limitations
+
+See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for a detailed breakdown of what the toolkit cannot do, where detection has gaps, and what constraints are inherent to offline minidump analysis.
+
 ## Troubleshooting
 
 | Problem | Fix |

@@ -791,6 +791,11 @@ def walk_stack_frames(
 
 # ─── YARA Integration ────────────────────────────────────────────────────────
 
+# YARA compilation cache — avoids recompiling rules for every binary.
+# Key: resolved rules_dir path. Value: list of (compiled_rule, source_path).
+_yara_rule_cache: dict[str, list[tuple[Any, str]]] = {}
+
+
 def scan_with_yara(data: bytes, rules_dir: str | None = None) -> list[dict[str, Any]]:
     """Scan binary data with YARA rules from a directory.
 
@@ -815,46 +820,52 @@ def scan_with_yara(data: bytes, rules_dir: str | None = None) -> list[dict[str, 
 
     matches_out: list[dict[str, Any]] = []
 
-    rule_files = {}
-    for root, _dirs, files in os.walk(rules_dir):
-        for fname in files:
-            if fname.endswith((".yar", ".yara")):
-                rule_files[os.path.join(root, fname)] = os.path.join(root, fname)
-
-    if not rule_files:
-        return []
-
-    # Many community rulesets (signature-base, etc.) use external variables.
-    # Provide sensible defaults so rules compile without errors.
-    externals = {
-        "filepath": "",
-        "filename": "",
-        "filetype": "",
-        "extension": "",
-        "owner": "",
-    }
-
-    # Compile rules individually so one broken file doesn't kill the scan.
-    # Track (compiled_rule, source_path) to attribute matches to rulesets.
-    compiled_rules: list[tuple[Any, str]] = []
-    skipped = 0
-    for fpath in rule_files.values():
-        try:
-            compiled_rules.append(
-                (yara.compile(filepath=fpath, externals=externals), fpath)
-            )
-        except yara.SyntaxError as e:
-            logger.debug("YARA skip %s: %s", fpath, e)
-            skipped += 1
-        except yara.Error as e:
-            logger.debug("YARA skip %s: %s", fpath, e)
-            skipped += 1
-
-    if skipped:
-        logger.info("YARA: compiled %d rules, skipped %d broken files",
-                     len(compiled_rules), skipped)
+    # Check compilation cache (avoids recompiling per-binary)
+    if rules_dir in _yara_rule_cache:
+        compiled_rules = _yara_rule_cache[rules_dir]
     else:
-        logger.debug("YARA: compiled all %d rule files", len(compiled_rules))
+        rule_files = {}
+        for root, _dirs, files in os.walk(rules_dir):
+            for fname in files:
+                if fname.endswith((".yar", ".yara")):
+                    rule_files[os.path.join(root, fname)] = os.path.join(root, fname)
+
+        if not rule_files:
+            return []
+
+        # Many community rulesets (signature-base, etc.) use external variables.
+        # Provide sensible defaults so rules compile without errors.
+        externals = {
+            "filepath": "",
+            "filename": "",
+            "filetype": "",
+            "extension": "",
+            "owner": "",
+        }
+
+        # Compile rules individually so one broken file doesn't kill the scan.
+        # Track (compiled_rule, source_path) to attribute matches to rulesets.
+        compiled_rules: list[tuple[Any, str]] = []
+        skipped = 0
+        for fpath in rule_files.values():
+            try:
+                compiled_rules.append(
+                    (yara.compile(filepath=fpath, externals=externals), fpath)
+                )
+            except yara.SyntaxError as e:
+                logger.debug("YARA skip %s: %s", fpath, e)
+                skipped += 1
+            except yara.Error as e:
+                logger.debug("YARA skip %s: %s", fpath, e)
+                skipped += 1
+
+        if skipped:
+            logger.info("YARA: compiled %d rules, skipped %d broken files",
+                         len(compiled_rules), skipped)
+        else:
+            logger.debug("YARA: compiled all %d rule files", len(compiled_rules))
+
+        _yara_rule_cache[rules_dir] = compiled_rules
 
     import warnings
 

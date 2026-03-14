@@ -38,6 +38,51 @@ from memdump_toolkit.pe_utils import (
 )
 
 
+# ─── Parallel Analysis ──────────────────────────────────────────────────────
+
+# Worker state — initialized once per process via ProcessPoolExecutor initializer
+_worker_yara_dir: str | None = None
+_worker_known_good: set[str] | None = None
+
+
+def _init_worker(yara_dir: str | None, known_good: set[str] | None) -> None:
+    """Initialize worker process state (called once per worker by ProcessPoolExecutor)."""
+    global _worker_yara_dir, _worker_known_good
+    _worker_yara_dir = yara_dir
+    _worker_known_good = known_good
+
+
+def _analyze_file_worker(args: tuple[str, str]) -> dict[str, Any] | None:
+    """Analyze a single binary file in a worker process.
+
+    Args:
+        args: (filepath, source) tuple — must be a single arg for Pool.map().
+
+    Returns:
+        Analysis result dict, or None if file is unreadable/too small.
+    """
+    filepath, source = args
+    try:
+        fsize = os.path.getsize(filepath)
+        if fsize < 0x200:
+            return None
+        with open(filepath, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None
+
+    result = analyze_single_binary(
+        filepath, data, source=source,
+        yara_rules_dir=_worker_yara_dir,
+        known_good=_worker_known_good,
+    )
+
+    if not result.get("is_pe", False):
+        return None
+
+    return result
+
+
 # ─── Classification ──────────────────────────────────────────────────────────
 
 def classify_language(data: bytes, pe_info: dict) -> str | None:
@@ -636,12 +681,12 @@ def analyze(
 
     Expects extract_dlls.analyze() to have already run, producing
     out_dir/modules/ and out_dir/hidden/ directories.
+
+    Uses ProcessPoolExecutor for parallel analysis when multiple binaries
+    are present. Falls back to sequential on failure.
     """
-    results: list[dict] = []
-    seen_hashes: set[str] = set()  # deduplicate by SHA256
-    total = 0
-    skipped_tier0 = 0
-    skipped_trusted = 0
+    # ─── Collect all files to analyze ─────────────────────────────────
+    file_tasks: list[tuple[str, str]] = []  # (filepath, source)
 
     dirs_to_scan = [
         (os.path.join(out_dir, "modules"), "listed"),
@@ -651,56 +696,76 @@ def analyze(
     for scan_dir, source in dirs_to_scan:
         if not os.path.isdir(scan_dir):
             continue
-
-        files = sorted(os.listdir(scan_dir))
-        logger.info(f"Scanning {len(files)} {source} binaries...")
-
-        for fname in files:
+        for fname in sorted(os.listdir(scan_dir)):
             fpath = os.path.join(scan_dir, fname)
-            if not os.path.isfile(fpath):
+            if os.path.isfile(fpath):
+                file_tasks.append((fpath, source))
+
+    if not file_tasks:
+        logger.info("No binaries found to analyze.")
+        return []
+
+    logger.info(f"Analyzing {len(file_tasks)} binaries...")
+
+    # ─── Run analysis (parallel or sequential) ───────────────────────
+    raw_results: list[dict] = []
+    used_parallel = False
+
+    max_workers = min(os.cpu_count() or 1, 4)
+
+    if max_workers > 1 and len(file_tasks) >= 4:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            logger.info(f"  Using {max_workers} parallel workers")
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_init_worker,
+                initargs=(yara_rules_dir, known_good),
+            ) as pool:
+                for result in pool.map(_analyze_file_worker, file_tasks):
+                    if result is not None:
+                        raw_results.append(result)
+            used_parallel = True
+        except Exception as e:
+            logger.info(f"  Parallel analysis failed ({e}), falling back to sequential")
+            raw_results = []
+
+    if not used_parallel:
+        # Set worker state in main process for sequential mode
+        _init_worker(yara_rules_dir, known_good)
+        for filepath, source in file_tasks:
+            result = _analyze_file_worker((filepath, source))
+            if result is not None:
+                raw_results.append(result)
+
+    # ─── Post-process: tier filtering + dedup ─────────────────────────
+    results: list[dict] = []
+    seen_hashes: set[str] = set()
+    skipped_tier0 = 0
+    skipped_trusted = 0
+
+    for result in raw_results:
+        # Tier 0 skip
+        if result.get("tier") == 0:
+            skipped_tier0 += 1
+            continue
+
+        # Deduplicate by SHA-256
+        sha = result.get("hashes", {}).get("sha256", "")
+        if sha in seen_hashes:
+            continue
+        if sha:
+            seen_hashes.add(sha)
+
+        # Tier 1: only keep if risk >= 10
+        if result.get("tier") == 1:
+            if result.get("risk_score", 0) < 10:
+                skipped_trusted += 1
                 continue
-            fsize = os.path.getsize(fpath)
-            if fsize < 0x200:  # Too small for valid PE
-                continue
 
-            total += 1
+        results.append(result)
 
-            try:
-                with open(fpath, "rb") as f:
-                    data = f.read()
-            except Exception as e:
-                logger.warning("Failed to analyze module '%s': %s", fname, e)
-                continue
-
-            result = analyze_single_binary(
-                fpath, data, source=source,
-                yara_rules_dir=yara_rules_dir,
-                known_good=known_good,
-            )
-
-            if not result.get("is_pe", False):
-                continue
-
-            # Tier 0 skip
-            if result.get("tier") == 0:
-                skipped_tier0 += 1
-                continue
-
-            # Deduplicate
-            sha = result.get("hashes", {}).get("sha256", "")
-            if sha in seen_hashes:
-                continue
-            if sha:
-                seen_hashes.add(sha)
-
-            if result.get("tier") == 1:
-                # Still record if it has anomalies
-                if result.get("risk_score", 0) < 10:
-                    skipped_trusted += 1
-                    continue
-
-            results.append(result)
-
+    total = len(file_tasks)
     logger.info(f"\nAnalyzed {total} binaries:")
     logger.info(f"  {skipped_tier0} resource-only (skipped)")
     logger.info(f"  {skipped_trusted} trusted (lightweight check)")

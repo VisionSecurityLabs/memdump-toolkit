@@ -85,9 +85,9 @@ The toolkit identifies what is suspicious (injection indicators, malicious modul
 
 ## 4. Performance Constraints
 
-### Single-threaded analysis
+### Parallel analysis overhead
 
-Module analysis (Step 3) processes binaries sequentially. On dumps with 200+ modules, this is the bottleneck. Parallelizing binary analysis across CPU cores would improve throughput but requires careful handling of shared state (seen hashes, output files).
+Module analysis (Step 3) uses `ProcessPoolExecutor` to analyze binaries across CPU cores (up to 4 workers). Each worker compiles YARA rules once on startup, so there is a per-worker initialization cost. For dumps with fewer than 4 binaries, analysis runs sequentially. On single-core systems or restricted environments where multiprocessing is unavailable, the toolkit falls back to sequential automatically.
 
 ### YARA compilation overhead
 
@@ -122,8 +122,8 @@ These are concrete improvements that would close the most impactful gaps:
 |----------|---------|--------|--------|
 | High | Threat intel enrichment (VT, OTX, AbuseIPDB) | Confirms whether IOCs are known-bad | Medium |
 | High | Multi-dump correlation | Traces injection chains across processes | High |
-| Medium | Parallel binary analysis | Speeds up Step 3 on large dumps | Low |
-| Medium | YARA rule caching | Speeds up repeated scans | Low |
+| ~~Medium~~ | ~~Parallel binary analysis~~ | ~~Speeds up Step 3 on large dumps~~ | **DONE** |
+| ~~Medium~~ | ~~YARA rule caching~~ | ~~Speeds up repeated scans~~ | **DONE** |
 | Medium | SEH/unwind stack walking | Better stack traces on optimized binaries | High |
 | Low | Volatility integration | Supports full memory images | High |
 | Low | Interactive HTML report | Rich visualization for analysts | Medium |

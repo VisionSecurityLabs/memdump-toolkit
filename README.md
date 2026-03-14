@@ -59,6 +59,8 @@ Binaries are scored 0-100 and categorized: **CRITICAL** (60+), **HIGH** (30+), *
 
 On a 217-module SQL Server dump: 58 skipped, 142 lightweight, 17 full → **completes in ~25 seconds**.
 
+Step 3 (binary analysis) runs in parallel across up to 4 CPU cores. YARA rules compile once per worker process and are cached for all subsequent binaries. Falls back to sequential automatically on single-core systems.
+
 ## Installation
 
 ```bash
@@ -301,7 +303,7 @@ See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for a detailed breakdown of what 
 | "No modules found" | Dump may lack module list — hidden PE scan still runs |
 | "YARA scan failed" | `uv sync --extra yara` + check rule syntax |
 | "Failed to read module memory" | Dump truncated — toolkit falls back to page-by-page reading |
-| Slow on large dumps | Normal for >1 GB; dump is parsed once, modules are filtered by tier |
+| Slow on large dumps | Normal for >1 GB; dump is parsed once, binary analysis runs in parallel, modules are filtered by tier |
 | Too many false positives | System DLLs should score 0 — check if paths are in trusted list |
 | Hashes don't match VirusTotal | **Expected.** Memory-dumped DLLs differ from on-disk originals due to relocation, IAT patching, and page zeroing. See [Architecture § Why memory-dumped hashes don't match](docs/ARCHITECTURE.md#why-memory-dumped-hashes-dont-match-on-disk-files). Use `--known-good` with memory-image hash sets instead. |
 

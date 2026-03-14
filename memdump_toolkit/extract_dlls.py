@@ -147,6 +147,66 @@ def extract_hidden_pes(
             "packed_sections": "|".join(packed),
         })
 
+    # Second pass: headerless PE recovery (MZ header zeroed out)
+    from memdump_toolkit.pe_utils import find_headerless_pe
+    headerless_count = 0
+    for seg in reader.memory_segments:
+        base = seg.start_virtual_address
+        seg_size = seg.end_virtual_address - base
+        if seg_size < 0x200 or base in known_bases:
+            continue
+        # Skip segments where we already found a normal PE
+        if any(r.get("base") == f"0x{base:016x}" for r in results):
+            continue
+        try:
+            hdr_data = reader.read(base, min(seg_size, 0x2000))
+        except Exception:
+            continue
+        # Only scan segments that DON'T start with MZ (those were already handled)
+        if hdr_data[:2] == b"MZ":
+            continue
+        candidates = find_headerless_pe(hdr_data, base)
+        for cand in candidates:
+            headerless_count += 1
+            count += 1
+            # Read the full estimated image
+            est_size = cand.get("image_size_est", seg_size)
+            read_size = min(est_size, seg_size)
+            try:
+                data = reader.read(base, read_size)
+            except Exception:
+                logger.warning("Failed to read headerless PE at 0x%x, skipping", base)
+                continue
+
+            fname = f"headerless_{headerless_count:03d}_0x{base:x}.bin"
+            with open(os.path.join(hidden_dir, fname), "wb") as f:
+                f.write(data)
+
+            machine_str = "x64" if cand.get("machine") == 0x8664 else "x86" if cand.get("machine") == 0x014C else "unknown"
+            sec_names = [s["name"] for s in cand.get("sections", [])]
+            logger.info(f"  [{count:3d}] 0x{base:016x}  HEADERLESS  {len(data):>10,} bytes  {machine_str}  sections: {', '.join(sec_names)}")
+
+            results.append({
+                "file": fname, "base": f"0x{base:016x}",
+                "image_size": est_size, "captured_size": len(data),
+                "is_dll": False,  # Can't determine without full PE header
+                "entry_point": "",
+                "timestamp": "",
+                "timestamp_str": "",
+                "num_sections": cand["num_sections"],
+                "sections": "|".join(sec_names),
+                "identity": "HEADERLESS_PE",
+                "export_name": "",
+                "md5": "", "sha256": "",
+                "packed_sections": "",
+                "headerless": True,
+                "machine": machine_str,
+                "machine_confirmed": cand.get("machine_confirmed", False),
+            })
+
+    if headerless_count:
+        logger.info(f"\n  Headerless PE recovery found {headerless_count} additional PE(s)")
+
     return results
 
 

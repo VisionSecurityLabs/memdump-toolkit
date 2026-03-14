@@ -364,6 +364,11 @@ IMAGE_SCN_MEM_READ = 0x40000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
 IMAGE_SCN_MEM_RWX = IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE
 
+# Section unpacking detection thresholds
+UNPACK_VSIZE_RATIO_THRESHOLD = 10    # virtual_size / raw_size ratio that suggests unpacking
+UNPACK_MIN_SECTION_SIZE = 0x2000     # ignore tiny sections (8 KB)
+UNPACK_ENTROPY_THRESHOLD = 6.5       # unpacked-at-runtime code: high but not maximum entropy
+
 # Minimum PE image size
 MIN_PE_SIZE = 0x200
 
@@ -375,3 +380,43 @@ MAX_SEGMENT_SCAN_SIZE = 50_000_000
 
 # Suspicious entry point value
 SUSPICIOUS_EP_VALUE = 0x200
+
+# ─── Headerless PE Recovery ──────────────────────────────────────────────────
+
+# Valid PE Machine field values
+PE_MACHINE_I386 = 0x014C
+PE_MACHINE_AMD64 = 0x8664
+PE_VALID_MACHINES = {PE_MACHINE_I386, PE_MACHINE_AMD64}
+
+# Section characteristics that indicate code
+PE_SECTION_CODE_EXEC_READ = 0x60000020  # CODE | EXECUTE | READ
+
+# Common PE section names (as bytes, null-padded to 8 bytes)
+PE_KNOWN_SECTION_NAMES = {
+    b".text\x00\x00\x00", b".rdata\x00\x00", b".data\x00\x00\x00",
+    b".rsrc\x00\x00\x00", b".reloc\x00\x00", b".pdata\x00\x00",
+    b".edata\x00\x00", b".idata\x00\x00", b".bss\x00\x00\x00\x00",
+    b".tls\x00\x00\x00\x00", b".CRT\x00\x00\x00\x00",
+}
+
+# Section header size in PE format
+PE_SECTION_HEADER_SIZE = 40
+
+# Minimum/maximum section count for validation
+PE_MIN_SECTIONS_HEADERLESS = 2
+PE_MAX_SECTIONS_HEADERLESS = 96  # PE spec maximum
+
+# ─── Stack Frame Walking ─────────────────────────────────────────────────────
+
+# Maximum frames to walk before giving up (prevent infinite loops)
+MAX_STACK_FRAMES = 64
+
+# Pointer sizes per architecture
+STACK_PTR_SIZE_32 = 4
+STACK_PTR_SIZE_64 = 8
+
+# Stack scan: maximum bytes to scan from RSP/ESP
+MAX_STACK_SCAN_SIZE = 0x10000  # 64 KB
+
+# Minimum frames outside modules to trigger escalation to CRITICAL
+STACK_CRITICAL_THRESHOLD = 3

@@ -1,0 +1,10 @@
+# Known-good SHA-256 hashes for common Windows system DLLs
+# Source: curated from clean Windows 10/11 and Windows Server 2019/2022 installations
+# Format: one SHA-256 hash per line
+# Last updated: 2026-03-14
+#
+# This is a starter set. Add your own hashes or place additional .txt/.csv files
+# in ~/.memdump-toolkit/known-good/ to expand the list.
+#
+# To use: memdump-toolkit full dump.dmp --known-good auto
+# Or:     memdump-toolkit binary-scan dump.dmp --known-good auto

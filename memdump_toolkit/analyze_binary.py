@@ -30,39 +30,12 @@ from memdump_toolkit.constants import (
     LANG_SIGNATURES, MAX_SCAN_SIZE, PACKER_SIGNATURES, TRUSTED_PATH_FRAGMENTS,
     TIMESTAMP_EPOCH_ZERO, TIMESTAMP_EPOCH_MAX,
     TIMESTAMP_YEAR_MIN, TIMESTAMP_YEAR_MAX,
+    UNPACK_VSIZE_RATIO_THRESHOLD, UNPACK_MIN_SECTION_SIZE, UNPACK_ENTROPY_THRESHOLD,
 )
 from memdump_toolkit.pe_utils import (
     compute_hashes, extract_imports, get_pe_info, is_trusted_path,
     logger, scan_with_yara, severity_label, setup_logging, write_csv,
 )
-
-def load_known_good_hashes(path: str) -> set[str]:
-    """Load SHA-256 hashes from a file (one hex digest per line).
-
-    Supports NSRL RDS format (SHA-256 in first column, comma-separated)
-    and plain text (one hash per line). Lines starting with # are skipped.
-    Returns the set of loaded hashes.
-    """
-    known_good: set[str] = set()
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # NSRL CSV: "SHA-256","MD5","CRC32","FileName",...
-            # Skip header row (contains alphabetic column names)
-            if line.startswith('"SHA') or line.startswith('"sha'):
-                continue
-            # Plain text: just the hash; CSV: first field
-            token = line.split(",")[0].strip('" ').lower()
-            if len(token) == 64:
-                try:
-                    int(token, 16)  # validate hex
-                    known_good.add(token)
-                except ValueError:
-                    continue
-    logger.info("Loaded %d known-good hashes from %s", len(known_good), path)
-    return known_good
 
 
 # ─── Classification ──────────────────────────────────────────────────────────
@@ -149,7 +122,7 @@ def detect_packer_artifacts(data: bytes, sections: list[dict]) -> list[dict]:
     return found
 
 
-def detect_section_anomalies(sections: list[dict]) -> list[dict]:
+def detect_section_anomalies(sections: list[dict], section_entropies: list[dict] | None = None) -> list[dict]:
     """Detect suspicious section characteristics."""
     anomalies: list[dict] = []
 
@@ -195,6 +168,26 @@ def detect_section_anomalies(sections: list[dict]) -> list[dict]:
                 "section": name, "type": "zero_exec",
                 "detail": "Zero-size executable section",
             })
+
+        # Section unpacking: large virtual_size vs tiny raw_size + high entropy
+        raw_size = sec.get("raw_size", 0)
+        if (raw_size > 0
+                and vsize > 0
+                and vsize >= UNPACK_MIN_SECTION_SIZE
+                and vsize / raw_size >= UNPACK_VSIZE_RATIO_THRESHOLD
+                and (chars & IMAGE_SCN_MEM_EXECUTE)):
+            # Check entropy if available
+            ent = 0.0
+            if section_entropies:
+                for se in section_entropies:
+                    if se["name"] == name:
+                        ent = se.get("entropy", 0.0)
+                        break
+            if ent >= UNPACK_ENTROPY_THRESHOLD:
+                anomalies.append({
+                    "section": name, "type": "unpacked",
+                    "detail": f"Likely runtime-unpacked: vsize/rsize={vsize/raw_size:.0f}x, entropy={ent:.1f}",
+                })
 
     return anomalies
 
@@ -313,7 +306,7 @@ def analyze_single_binary(
     result["imported_dlls"] = sorted(imports.keys())
 
     # Section anomalies
-    section_anomalies = detect_section_anomalies(sections)
+    section_anomalies = detect_section_anomalies(sections, pe_info.get("section_entropy"))
     if section_anomalies:
         result["section_anomalies"] = section_anomalies
 
@@ -483,6 +476,11 @@ def compute_risk_score(
         score += 15
         factors.append(f"rwx_sections({len(rwx)})")
 
+    unpacked = [a for a in anomalies if a["type"] == "unpacked"]
+    if unpacked:
+        score += 15
+        factors.append(f"section_unpacking({len(unpacked)})")
+
     # High entropy sections
     if result.get("high_entropy_sections"):
         score += 10
@@ -493,6 +491,11 @@ def compute_risk_score(
     if ts_anomaly and ts_anomaly not in ("epoch_zero", "max_value"):
         score += 5
         factors.append(f"timestamp_{ts_anomaly}")
+
+    # Headerless PE (MZ header zeroed — strong evasion indicator)
+    if result.get("source") == "hidden" and "headerless" in str(result.get("file", "")):
+        score += 25
+        factors.append("headerless_pe")
 
     # Config extraction found IOCs
     config = result.get("config", {})

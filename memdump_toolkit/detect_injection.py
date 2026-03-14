@@ -391,6 +391,94 @@ def check_suspicious_imports(reader: Any, modules: list, is_32bit: bool) -> list
     return findings
 
 
+def check_thread_stacks(
+    mf: Any, modules: list, reader: Any, is_32bit: bool,
+) -> list[dict]:
+    """CHECK 9: Walk thread stacks to find return addresses outside known modules.
+
+    Catches threads that were called FROM shellcode but are currently executing
+    inside a legitimate module (e.g., in kernel32.Sleep after being called from
+    injected code).
+    """
+    from memdump_toolkit.constants import STACK_CRITICAL_THRESHOLD
+    from memdump_toolkit.pe_utils import walk_stack_frames
+
+    findings: list[dict] = []
+    if not hasattr(mf, "threads") or not mf.threads:
+        return findings
+
+    module_ranges = _build_module_ranges(modules)
+
+    # Build executable memory ranges (for stack scan false positive filtering)
+    exec_ranges: list[tuple[int, int]] = []
+    if hasattr(mf, "memory_info") and mf.memory_info:
+        EXECUTABLE_PROTECTS = (
+            PAGE_EXECUTE, PAGE_EXECUTE_READ,
+            PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        )
+        try:
+            entries = getattr(mf.memory_info, "infos", None) or mf.memory_info.entries
+            for info in entries:
+                if (getattr(info, "State", 0) == 0x1000
+                        and getattr(info, "Protect", 0) in EXECUTABLE_PROTECTS):
+                    exec_ranges.append((info.BaseAddress, info.BaseAddress + info.RegionSize))
+        except AttributeError:
+            pass
+
+    try:
+        threads = mf.threads.threads
+    except AttributeError:
+        return findings
+
+    for thread in threads:
+        try:
+            ctx = thread.ThreadContext
+            if ctx is None:
+                continue
+
+            if is_32bit:
+                rsp = getattr(ctx, "Esp", 0) or 0
+                rbp = getattr(ctx, "Ebp", 0) or 0
+            else:
+                rsp = getattr(ctx, "Rsp", 0) or 0
+                rbp = getattr(ctx, "Rbp", 0) or 0
+
+            if rsp <= 0x10000:
+                continue
+
+            frames = walk_stack_frames(
+                reader, rsp, rbp, module_ranges,
+                is_32bit=is_32bit, exec_ranges=exec_ranges,
+            )
+
+            # Find return addresses outside any known module
+            outside = [f for f in frames if not f["in_module"]]
+            if not outside:
+                continue
+
+            sev = "CRITICAL" if len(outside) >= STACK_CRITICAL_THRESHOLD else "HIGH"
+            findings.append({
+                "type": "STACK_RETURN_OUTSIDE_MODULE",
+                "severity": sev,
+                "thread_id": thread.ThreadId,
+                "suspicious_returns": len(outside),
+                "total_frames": len(frames),
+                "details": [
+                    {
+                        "address": f"0x{f['address']:016x}",
+                        "source": f["source"],
+                        "frame_depth": f.get("frame_depth", f.get("stack_offset", -1)),
+                    }
+                    for f in outside[:10]  # Cap details at 10 entries
+                ],
+            })
+        except Exception:
+            logger.debug("Failed to walk stack for TID %s",
+                         getattr(thread, "ThreadId", "?"))
+
+    return findings
+
+
 # ─── Core Analysis ───────────────────────────────────────────────────────────
 
 def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
@@ -629,6 +717,55 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     if deep_count:
         logger.info("  Deep scan found %d additional PE(s) inside segments", deep_count)
 
+    # Headerless PE recovery: find PEs with zeroed MZ headers
+    from memdump_toolkit.pe_utils import find_headerless_pe
+    headerless_count = 0
+    for seg in reader.memory_segments:
+        base = seg.start_virtual_address
+        seg_size = seg.end_virtual_address - base
+        if seg_size < 0x200 or base in found_bases:
+            continue
+        try:
+            hdr_data = reader.read(base, min(seg_size, 0x2000))
+        except Exception:
+            continue
+        if hdr_data[:2] == b"MZ":
+            continue
+        candidates = find_headerless_pe(hdr_data, base)
+        for cand in candidates:
+            found_bases.add(base)
+            hidden_count += 1
+            headerless_count += 1
+
+            machine_str = "x64" if cand.get("machine") == 0x8664 else "x86" if cand.get("machine") == 0x014C else "?"
+            sec_names = [s["name"] for s in cand.get("sections", [])]
+
+            severity = "CRITICAL"
+            flags_hl: list[str] = ["HEADERLESS_PE", "MZ_ZEROED"]
+            if not cand.get("machine_confirmed"):
+                flags_hl.append("MACHINE_UNCONFIRMED")
+                severity = "HIGH"
+
+            report["findings"].append({
+                "type": "HIDDEN_PE", "severity": severity,
+                "base": f"0x{base:016x}",
+                "image_size": cand.get("image_size_est", 0),
+                "captured_in_segment": seg_size,
+                "is_dll": False,
+                "entry_point": "",
+                "timestamp": "",
+                "identity": "HEADERLESS_PE",
+                "flags": flags_hl,
+                "machine": machine_str,
+                "num_sections": cand["num_sections"],
+                "section_names": sec_names,
+            })
+            logger.info("  [!!!] 0x%016x  HEADERLESS  %s  %d sections: %s  [MZ_ZEROED]",
+                        base, machine_str, cand["num_sections"], ", ".join(sec_names))
+
+    if headerless_count:
+        logger.info("  Headerless PE recovery found %d PE(s) with zeroed headers", headerless_count)
+
     logger.info("\n  Total hidden: %d  (Unknown: %d)", hidden_count, hidden_unknown)
 
     # CHECK 5: Untrusted paths
@@ -691,6 +828,22 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
         logger.info("  ⚠ %-50s  Categories: %s", Path(f['module']).name, cats)
     if not import_findings:
         logger.info("  No suspicious import combinations detected in untrusted modules.")
+
+    # CHECK 9: Stack frame walking
+    logger.info("\n%s", "=" * 80)
+    logger.info("[9] THREAD STACK RETURN ADDRESS ANALYSIS")
+    logger.info("%s", "=" * 80)
+
+    stack_findings = check_thread_stacks(mf, modules, reader, is_32bit)
+    for f in stack_findings:
+        report["findings"].append(f)
+        logger.info("  ⚠ Thread %s: %d/%d return addresses outside modules [%s]",
+                     f['thread_id'], f['suspicious_returns'], f['total_frames'],
+                     f['severity'])
+        for d in f.get("details", [])[:5]:
+            logger.info("      → %s (%s)", d['address'], d['source'])
+    if not stack_findings:
+        logger.info("  No suspicious stack return addresses detected.")
 
     # Summary
     logger.info("\n%s", "=" * 80)

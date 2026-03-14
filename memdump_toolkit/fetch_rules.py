@@ -43,23 +43,31 @@ RULESETS: dict[str, dict[str, str]] = {
     },
 }
 
-def resolve_yara_dir(yara_dir: str | None) -> str | None:
+def resolve_yara_dir(yara_dir: str | None, auto_fetch: bool = False) -> str | None:
     """Resolve --yara-rules value.
 
     - None → no YARA scanning
-    - "auto" → use default rules dir (must exist)
+    - "auto" → use default rules dir; auto-fetch if missing
     - anything else → use as explicit path
     """
     if yara_dir is None:
         return None
     if yara_dir != "auto":
         return yara_dir
-    if not RULES_DIR.exists() or not any(RULES_DIR.iterdir()):
-        raise click.ClickException(
-            f"No rules found at {RULES_DIR}. "
-            "Run 'memdump-toolkit fetch-rules' first."
-        )
-    return str(RULES_DIR)
+    if RULES_DIR.exists() and any(RULES_DIR.iterdir()):
+        return str(RULES_DIR)
+    # No rules installed — offer to fetch
+    if auto_fetch or click.confirm(
+        "No YARA rules found. Download community rulesets now (~500 MB)?",
+        default=True,
+    ):
+        fetch_rulesets(None)
+        if RULES_DIR.exists() and any(RULES_DIR.iterdir()):
+            return str(RULES_DIR)
+        click.echo("Warning: YARA rule download failed, skipping YARA scan.", err=True)
+        return None
+    # User declined
+    return None
 
 
 def list_installed() -> list[dict[str, Any]]:

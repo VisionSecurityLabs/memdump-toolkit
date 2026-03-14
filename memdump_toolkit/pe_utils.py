@@ -473,6 +473,322 @@ def check_pe_header(
     return pe_off, img_size, hdr
 
 
+def find_headerless_pe(data: bytes, base_addr: int = 0) -> list[dict[str, Any]]:
+    """Find PE artifacts in memory where the MZ header has been zeroed out.
+
+    Searches for section table patterns (characteristics, section names)
+    and validates by finding the IMAGE_FILE_HEADER.Machine field nearby.
+
+    Returns list of candidate PEs:
+        [{"offset": int, "machine": int, "num_sections": int, "image_size_est": int}]
+    """
+    from memdump_toolkit.constants import (
+        PE_VALID_MACHINES, PE_SECTION_CODE_EXEC_READ, PE_KNOWN_SECTION_NAMES,
+        PE_SECTION_HEADER_SIZE, PE_MIN_SECTIONS_HEADERLESS, PE_MAX_SECTIONS_HEADERLESS,
+    )
+    import struct
+
+    results: list[dict[str, Any]] = []
+    if len(data) < 0x200:
+        return results
+
+    # Strategy: scan for section characteristic patterns at 40-byte intervals.
+    # In a PE section table, the Characteristics field is at offset +36 within
+    # each 40-byte section header. If we find CODE|EXECUTE|READ (0x60000020)
+    # at some offset, the next section's characteristics would be at offset+40.
+
+    # Scan for the characteristic pattern
+    target_chars = struct.pack("<I", PE_SECTION_CODE_EXEC_READ)
+    scan_limit = min(len(data), 0x2000)  # Section table is always in first ~8 KB
+
+    pos = 0
+    while pos < scan_limit - 4:
+        idx = data.find(target_chars, pos, scan_limit)
+        if idx == -1:
+            break
+        pos = idx + 1
+
+        # Characteristics is at offset +36 within a 40-byte section header.
+        # So the start of this section header is at idx - 36.
+        sec_start = idx - 36
+        if sec_start < 0:
+            continue
+
+        # Validate: the first 8 bytes of the section header should be the name.
+        # Check if it looks like a known section name.
+        sec_name = data[sec_start:sec_start + 8]
+        name_match = sec_name in PE_KNOWN_SECTION_NAMES
+        # Also accept names that are printable ASCII (custom section names)
+        name_printable = all(
+            (0x20 <= b <= 0x7E or b == 0) for b in sec_name
+        ) and sec_name[0] != 0
+
+        if not (name_match or name_printable):
+            continue
+
+        # Walk forward and backward to find all consecutive section headers
+        sections_found: list[dict] = []
+
+        # Walk backward from sec_start to find earlier sections
+        check = sec_start
+        while check >= 0:
+            s_name = data[check:check + 8]
+            s_printable = all(
+                (0x20 <= b <= 0x7E or b == 0) for b in s_name
+            ) and len(s_name) == 8 and s_name[0] != 0
+
+            if not (s_name in PE_KNOWN_SECTION_NAMES or s_printable):
+                break
+
+            if check + 40 <= len(data):
+                vsize = struct.unpack_from("<I", data, check + 8)[0]
+                va = struct.unpack_from("<I", data, check + 12)[0]
+                rsize = struct.unpack_from("<I", data, check + 16)[0]
+                chars = struct.unpack_from("<I", data, check + 36)[0]
+                sections_found.insert(0, {
+                    "name": s_name.rstrip(b"\x00").decode("ascii", errors="replace"),
+                    "virtual_size": vsize,
+                    "virtual_address": va,
+                    "raw_size": rsize,
+                    "characteristics": chars,
+                })
+            check -= PE_SECTION_HEADER_SIZE
+
+        # Walk forward from the section after sec_start
+        check = sec_start + PE_SECTION_HEADER_SIZE
+        while check + PE_SECTION_HEADER_SIZE <= len(data) and check < scan_limit:
+            s_name = data[check:check + 8]
+            s_printable = all(
+                (0x20 <= b <= 0x7E or b == 0) for b in s_name
+            ) and len(s_name) == 8 and s_name[0] != 0
+
+            if not (s_name in PE_KNOWN_SECTION_NAMES or s_printable):
+                break
+
+            vsize = struct.unpack_from("<I", data, check + 8)[0]
+            va = struct.unpack_from("<I", data, check + 12)[0]
+            rsize = struct.unpack_from("<I", data, check + 16)[0]
+            chars = struct.unpack_from("<I", data, check + 36)[0]
+            sections_found.append({
+                "name": s_name.rstrip(b"\x00").decode("ascii", errors="replace"),
+                "virtual_size": vsize,
+                "virtual_address": va,
+                "raw_size": rsize,
+                "characteristics": chars,
+            })
+            check += PE_SECTION_HEADER_SIZE
+
+        # Validate: need at least PE_MIN_SECTIONS_HEADERLESS sections
+        if len(sections_found) < PE_MIN_SECTIONS_HEADERLESS:
+            continue
+        if len(sections_found) > PE_MAX_SECTIONS_HEADERLESS:
+            continue
+
+        # Validate: virtual addresses should be ascending
+        vas = [s["virtual_address"] for s in sections_found]
+        if vas != sorted(vas) or len(set(vas)) != len(vas):
+            continue
+
+        # Validate: all virtual addresses should be positive and reasonable
+        if any(va == 0 or va > 0x80000000 for va in vas):
+            continue
+
+        # Find the offset of the first section header in the table.
+        # sec_start is the header that matched CODE|EXEC|READ; find its
+        # index within sections_found so we can compute the table start.
+        trigger_va = struct.unpack_from("<I", data, sec_start + 12)[0]
+        trigger_idx = next(
+            (i for i, s in enumerate(sections_found)
+             if s["virtual_address"] == trigger_va),
+            0,
+        )
+        first_sec_offset = sec_start - trigger_idx * PE_SECTION_HEADER_SIZE
+
+        # Search for Machine field in the ~300 bytes before the section table
+        machine = 0
+        search_start = max(0, first_sec_offset - 300)
+        for moff in range(search_start, first_sec_offset):
+            if moff + 2 > len(data):
+                break
+            candidate = struct.unpack_from("<H", data, moff)[0]
+            if candidate in PE_VALID_MACHINES:
+                # Sanity: NumberOfSections should be at moff + 2
+                if moff + 4 <= len(data):
+                    num_sec = struct.unpack_from("<H", data, moff + 2)[0]
+                    if num_sec == len(sections_found):
+                        machine = candidate
+                        break
+
+        if machine == 0:
+            # Couldn't confirm Machine field — still report but lower confidence
+            pass
+
+        # Estimate image size from last section
+        last = sections_found[-1]
+        image_size_est = last["virtual_address"] + max(last["virtual_size"], last["raw_size"])
+
+        # Compute the actual PE start offset within the data buffer.
+        # The PE header (or where it would be) precedes the section table.
+        pe_data_offset = max(first_sec_offset - 300, 0)  # conservative estimate
+
+        # Avoid duplicates: skip if we already found a PE at a nearby offset
+        actual_addr = base_addr + pe_data_offset
+        if any(abs(r["offset"] - actual_addr) < 0x1000 for r in results):
+            continue
+
+        results.append({
+            "offset": actual_addr,
+            "machine": machine,
+            "num_sections": len(sections_found),
+            "sections": sections_found,
+            "image_size_est": image_size_est,
+            "machine_confirmed": machine != 0,
+        })
+
+        # Skip past this table to avoid re-detecting
+        pos = sec_start + len(sections_found) * PE_SECTION_HEADER_SIZE
+
+    return results
+
+
+def walk_stack_frames(
+    reader: Any,
+    rsp: int,
+    rbp: int,
+    module_ranges: list[tuple[int, int, str]],
+    is_32bit: bool = False,
+    exec_ranges: list[tuple[int, int]] | None = None,
+) -> list[dict[str, Any]]:
+    """Walk a thread's stack to extract return addresses and check module membership.
+
+    Uses a hybrid approach:
+      1. Frame pointer chain (RBP/EBP) — precise but breaks with -fomit-frame-pointer
+      2. Stack scan fallback — scans stack as pointer array, checks executable ranges
+
+    Args:
+        reader: Minidump memory reader
+        rsp: Stack pointer (RSP or ESP)
+        rbp: Frame pointer (RBP or EBP)
+        module_ranges: List of (start, end, name) for known modules
+        is_32bit: True for x86, False for x64
+        exec_ranges: Optional list of (start, end) for executable memory regions.
+                     Used in scan mode to filter false positives.
+
+    Returns:
+        List of return address entries:
+            [{"address": int, "in_module": bool, "module_name": str|None, "source": str}]
+    """
+    from memdump_toolkit.constants import (
+        MAX_STACK_FRAMES, STACK_PTR_SIZE_32, STACK_PTR_SIZE_64,
+        MAX_STACK_SCAN_SIZE,
+    )
+    import struct
+
+    ptr_size = STACK_PTR_SIZE_32 if is_32bit else STACK_PTR_SIZE_64
+    ptr_fmt = "<I" if is_32bit else "<Q"
+    results: list[dict[str, Any]] = []
+    seen_addrs: set[int] = set()
+
+    def _addr_in_module(addr: int) -> tuple[bool, str | None]:
+        for start, end, name in module_ranges:
+            if start <= addr < end:
+                return True, name
+        return False, None
+
+    def _addr_in_exec(addr: int) -> bool:
+        if exec_ranges is None:
+            return True  # If no exec info, accept all
+        for start, end in exec_ranges:
+            if start <= addr < end:
+                return True
+        return False
+
+    def _read_ptr(addr: int) -> int | None:
+        try:
+            data = reader.read(addr, ptr_size)
+            if len(data) < ptr_size:
+                return None
+            return struct.unpack(ptr_fmt, data)[0]
+        except Exception:
+            return None
+
+    # ── Phase 1: Frame pointer chain walk ────────────────────────────────
+    frame_count = 0
+    fp = rbp
+    chain_broken = False
+
+    if fp and fp > 0x10000:
+        for _ in range(MAX_STACK_FRAMES):
+            # Return address is at FP + ptr_size (EBP+4 or RBP+8)
+            ret_addr = _read_ptr(fp + ptr_size)
+            if ret_addr is None or ret_addr <= 0x10000:
+                chain_broken = True
+                break
+
+            if ret_addr not in seen_addrs:
+                seen_addrs.add(ret_addr)
+                in_mod, mod_name = _addr_in_module(ret_addr)
+                results.append({
+                    "address": ret_addr,
+                    "in_module": in_mod,
+                    "module_name": mod_name,
+                    "source": "frame_walk",
+                    "frame_depth": frame_count,
+                })
+            frame_count += 1
+
+            # Follow the chain: next FP is at [current FP]
+            next_fp = _read_ptr(fp)
+            if next_fp is None or next_fp <= fp or next_fp <= 0x10000:
+                chain_broken = True
+                break
+            fp = next_fp
+    else:
+        chain_broken = True
+
+    # ── Phase 2: Stack scan fallback ─────────────────────────────────────
+    # Only if frame chain broke within first 3 frames (likely optimized code)
+    if chain_broken and frame_count < 3 and rsp and rsp > 0x10000:
+        scan_size = min(MAX_STACK_SCAN_SIZE, 0x10000)
+        try:
+            stack_data = reader.read(rsp, scan_size)
+        except Exception:
+            stack_data = b""
+
+        for off in range(0, len(stack_data) - ptr_size + 1, ptr_size):
+            candidate = struct.unpack_from(ptr_fmt, stack_data, off)[0]
+
+            # Filter: must be a plausible code address
+            if candidate <= 0x10000:
+                continue
+            if is_32bit and candidate > 0x80000000:
+                continue
+            if not is_32bit and candidate > 0x00007FFFFFFFFFFF:
+                continue
+
+            # Filter: must be in an executable region (reduces false positives)
+            if not _addr_in_exec(candidate):
+                continue
+
+            if candidate in seen_addrs:
+                continue
+            seen_addrs.add(candidate)
+
+            in_mod, mod_name = _addr_in_module(candidate)
+            results.append({
+                "address": candidate,
+                "in_module": in_mod,
+                "module_name": mod_name,
+                "source": "stack_scan",
+                "stack_offset": off,
+            })
+
+            if len(results) >= MAX_STACK_FRAMES:
+                break
+
+    return results
+
+
 # ─── YARA Integration ────────────────────────────────────────────────────────
 
 def scan_with_yara(data: bytes, rules_dir: str | None = None) -> list[dict[str, Any]]:

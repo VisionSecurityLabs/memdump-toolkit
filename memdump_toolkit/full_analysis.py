@@ -523,6 +523,21 @@ def run(
         except Exception as e:
             print(critical(f"  Executive summary failed: {e}"))
 
+        # Interactive HTML Report
+        try:
+            from memdump_toolkit import html_report
+            exec_data = None
+            exec_json_path = os.path.join(out_dir, "executive_summary.json")
+            if os.path.exists(exec_json_path):
+                with open(exec_json_path) as f:
+                    exec_data = json.load(f)
+            html_path = html_report.generate(
+                out_dir, binary_results, c2_results, injection_report, exec_data,
+            )
+            print(dim(f"  HTML report: {html_path}"))
+        except Exception as e:
+            print(critical(f"  HTML report failed: {e}"))
+
         # Final Summary
         elapsed = time.time() - start
         print(f"\n\n{banner('#'*80)}")

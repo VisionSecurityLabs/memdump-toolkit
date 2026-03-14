@@ -41,9 +41,13 @@ The stack frame walker (CHECK 9) identifies return addresses outside known modul
 
 Executable `MEM_MAPPED` regions outside modules receive LOW severity. These could be legitimate memory-mapped sections (fonts, locale data) or injected code. Without the backing file path (which minidumps do not always include), there is no way to distinguish between the two.
 
-### SEH/unwind-based stack walking — not implemented
+### SEH/unwind stack walking limitations
 
-The stack frame walker uses frame pointer chains (RBP/EBP) with a heuristic stack scan fallback. Most optimized Windows binaries (including system DLLs) omit frame pointers and rely on SEH or `.pdata`/`.xdata` unwind information instead. Parsing these unwind structures would give more accurate stack traces on optimized code but requires implementing the Windows x64 unwind spec.
+The stack frame walker now uses `.pdata`/`.xdata` unwind information (Phase 0) for precise x64 stack walking, falling back to frame pointer chains and heuristic scan when unwind data is unavailable. Current limitations:
+
+- **x64 only** — 32-bit processes use SEH exception chains (different format), not `.pdata`. These still rely on frame pointer walking + stack scan.
+- **Requires readable .pdata** — if the module's .pdata section is not captured in the dump (truncated dump), falls back to heuristic methods.
+- **Prolog/epilog edge case** — if a thread is suspended mid-prolog or mid-epilog, the unwind delta may be slightly wrong. This is rare in practice (threads are typically in function bodies or system calls).
 
 ### Headerless PE recovery limits
 
@@ -124,7 +128,7 @@ These are concrete improvements that would close the most impactful gaps:
 | High | Multi-dump correlation | Traces injection chains across processes | High |
 | ~~Medium~~ | ~~Parallel binary analysis~~ | ~~Speeds up Step 3 on large dumps~~ | **DONE** |
 | ~~Medium~~ | ~~YARA rule caching~~ | ~~Speeds up repeated scans~~ | **DONE** |
-| Medium | SEH/unwind stack walking | Better stack traces on optimized binaries | High |
+| ~~Medium~~ | ~~SEH/unwind stack walking~~ | ~~Better stack traces on optimized binaries~~ | **DONE** |
 | Low | Volatility integration | Supports full memory images | High |
-| Low | Interactive HTML report | Rich visualization for analysts | Medium |
+| ~~Low~~ | ~~Interactive HTML report~~ | ~~Rich visualization for analysts~~ | **DONE** |
 | Low | SIGMA/YARA rule generation | Auto-generate detection rules from findings | Medium |

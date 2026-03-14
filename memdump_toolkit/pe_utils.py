@@ -651,6 +651,233 @@ def find_headerless_pe(data: bytes, base_addr: int = 0) -> list[dict[str, Any]]:
     return results
 
 
+# ─── x64 Unwind Information ────────────────────────────────────────────────
+
+# UNWIND_CODE operations
+UWOP_PUSH_NONVOL = 0
+UWOP_ALLOC_LARGE = 1
+UWOP_ALLOC_SMALL = 2
+UWOP_SET_FPREG = 3
+UWOP_SAVE_NONVOL = 4
+UWOP_SAVE_NONVOL_FAR = 5
+UWOP_SAVE_XMM128 = 8
+UWOP_SAVE_XMM128_FAR = 9
+UWOP_PUSH_MACHFRAME = 10
+
+UNW_FLAG_CHAININFO = 0x04
+
+
+def parse_pdata(pe_data: bytes, base_addr: int) -> list[tuple[int, int, int]]:
+    """Parse .pdata section from a PE to extract function unwind information.
+
+    Reads RUNTIME_FUNCTION entries and their UNWIND_INFO to compute
+    the total RSP adjustment (stack frame size) for each function.
+
+    Args:
+        pe_data: Raw PE file bytes
+        base_addr: Virtual address where this module is loaded
+
+    Returns:
+        Sorted list of (func_start_va, func_end_va, rsp_delta) where
+        rsp_delta is the number of bytes to add to RSP to reach the
+        return address (includes the return address push itself, so
+        read_ptr(RSP + rsp_delta) gives the caller's return address).
+        Empty list if no .pdata section found.
+    """
+    import struct
+
+    # Find PE header
+    if len(pe_data) < 0x40 or pe_data[:2] != b"MZ":
+        return []
+    pe_off = struct.unpack_from("<I", pe_data, 0x3C)[0]
+    if pe_off + 4 > len(pe_data) or pe_data[pe_off:pe_off + 4] != b"PE\x00\x00":
+        return []
+
+    # Read COFF header
+    coff_off = pe_off + 4
+    machine = struct.unpack_from("<H", pe_data, coff_off)[0]
+    if machine != 0x8664:  # x64 only
+        return []
+    num_sections = struct.unpack_from("<H", pe_data, coff_off + 2)[0]
+    optional_size = struct.unpack_from("<H", pe_data, coff_off + 16)[0]
+    sections_off = coff_off + 20 + optional_size
+
+    # Find .pdata section
+    pdata_rva = 0
+    pdata_size = 0
+    pdata_raw = 0
+    for i in range(num_sections):
+        sec_off = sections_off + i * 40
+        if sec_off + 40 > len(pe_data):
+            break
+        name = pe_data[sec_off:sec_off + 8].rstrip(b"\x00")
+        if name == b".pdata":
+            pdata_rva = struct.unpack_from("<I", pe_data, sec_off + 12)[0]
+            pdata_size = struct.unpack_from("<I", pe_data, sec_off + 16)[0]
+            pdata_raw = struct.unpack_from("<I", pe_data, sec_off + 20)[0]
+            break
+
+    if not pdata_raw or not pdata_size:
+        return []
+
+    # Build section map for RVA resolution
+    sec_map: list[tuple[int, int, int]] = []  # (rva, raw_offset, size)
+    for i in range(num_sections):
+        sec_off = sections_off + i * 40
+        if sec_off + 40 > len(pe_data):
+            break
+        s_rva = struct.unpack_from("<I", pe_data, sec_off + 12)[0]
+        s_raw_size = struct.unpack_from("<I", pe_data, sec_off + 16)[0]
+        s_raw_off = struct.unpack_from("<I", pe_data, sec_off + 20)[0]
+        s_virt_size = struct.unpack_from("<I", pe_data, sec_off + 8)[0]
+        sec_map.append((s_rva, s_raw_off, max(s_raw_size, s_virt_size)))
+
+    def rva_to_offset(rva: int) -> int | None:
+        for s_rva, s_raw, s_size in sec_map:
+            if s_rva <= rva < s_rva + s_size:
+                return s_raw + (rva - s_rva)
+        return None
+
+    def _compute_rsp_delta(unwind_rva: int) -> int:
+        """Compute total RSP delta from UNWIND_INFO at given RVA."""
+        off = rva_to_offset(unwind_rva)
+        if off is None or off + 4 > len(pe_data):
+            return 0
+
+        flags = pe_data[off] >> 3
+        count_of_codes = pe_data[off + 2]
+        codes_off = off + 4
+
+        delta = 0
+        i = 0
+        while i < count_of_codes:
+            code_off = codes_off + i * 2
+            if code_off + 2 > len(pe_data):
+                break
+            op = pe_data[code_off + 1] & 0x0F
+            op_info = (pe_data[code_off + 1] >> 4) & 0x0F
+
+            if op == UWOP_PUSH_NONVOL:
+                delta += 8
+                i += 1
+            elif op == UWOP_ALLOC_LARGE:
+                if op_info == 0:
+                    if code_off + 4 > len(pe_data):
+                        break
+                    alloc = struct.unpack_from("<H", pe_data, code_off + 2)[0] * 8
+                    delta += alloc
+                    i += 2
+                else:
+                    if code_off + 6 > len(pe_data):
+                        break
+                    alloc = struct.unpack_from("<I", pe_data, code_off + 2)[0]
+                    delta += alloc
+                    i += 3
+            elif op == UWOP_ALLOC_SMALL:
+                delta += (op_info + 1) * 8
+                i += 1
+            elif op == UWOP_SET_FPREG:
+                i += 1  # Frame pointer based -- delta already accounts for pushes
+            elif op == UWOP_SAVE_NONVOL:
+                i += 2
+            elif op == UWOP_SAVE_NONVOL_FAR:
+                i += 3
+            elif op == UWOP_SAVE_XMM128:
+                i += 2
+            elif op == UWOP_SAVE_XMM128_FAR:
+                i += 3
+            elif op == UWOP_PUSH_MACHFRAME:
+                delta += 48 if op_info else 40
+                i += 1
+            else:
+                i += 1  # Unknown op, skip
+
+        # Handle chained unwind info
+        if flags & UNW_FLAG_CHAININFO:
+            # After the unwind codes (aligned to even count), there's a RUNTIME_FUNCTION
+            aligned_count = count_of_codes + (count_of_codes % 2)
+            chain_off = codes_off + aligned_count * 2
+            if chain_off + 12 <= len(pe_data):
+                chain_unwind_rva = struct.unpack_from("<I", pe_data, chain_off + 8)[0]
+                delta += _compute_rsp_delta(chain_unwind_rva)
+
+        return delta
+
+    # Parse RUNTIME_FUNCTION entries (12 bytes each)
+    results: list[tuple[int, int, int]] = []
+    num_entries = pdata_size // 12
+
+    for i in range(num_entries):
+        entry_off = pdata_raw + i * 12
+        if entry_off + 12 > len(pe_data):
+            break
+        begin_rva, end_rva, unwind_rva = struct.unpack_from("<III", pe_data, entry_off)
+        if begin_rva == 0 and end_rva == 0:
+            continue
+
+        rsp_delta = _compute_rsp_delta(unwind_rva)
+
+        results.append((
+            base_addr + begin_rva,
+            base_addr + end_rva,
+            rsp_delta,
+        ))
+
+    results.sort()
+    return results
+
+
+def unwind_frame(
+    reader: Any,
+    rip: int,
+    rsp: int,
+    pdata_tables: list[list[tuple[int, int, int]]],
+) -> tuple[int, int] | None:
+    """Unwind one stack frame using .pdata information.
+
+    Finds the RUNTIME_FUNCTION containing rip, applies the RSP delta
+    to locate the return address, and returns the new (rip, rsp).
+
+    Args:
+        reader: Minidump memory reader
+        rip: Current instruction pointer
+        rsp: Current stack pointer
+        pdata_tables: List of parsed .pdata tables (from parse_pdata)
+
+    Returns:
+        (new_rip, new_rsp) tuple, or None if unwinding failed.
+    """
+    import struct
+
+    # Binary search across all pdata tables for the function containing RIP
+    for table in pdata_tables:
+        lo, hi = 0, len(table) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            func_start, func_end, rsp_delta = table[mid]
+            if rip < func_start:
+                hi = mid - 1
+            elif rip >= func_end:
+                lo = mid + 1
+            else:
+                # Found the function
+                # Return address is at RSP + rsp_delta
+                ret_addr_loc = rsp + rsp_delta
+                try:
+                    data = reader.read(ret_addr_loc, 8)
+                    if len(data) < 8:
+                        return None
+                    new_rip = struct.unpack("<Q", data)[0]
+                    new_rsp = ret_addr_loc + 8  # Past the return address
+                    if new_rip <= 0x10000 or new_rip > 0x00007FFFFFFFFFFF:
+                        return None
+                    return (new_rip, new_rsp)
+                except Exception:
+                    return None
+
+    return None
+
+
 def walk_stack_frames(
     reader: Any,
     rsp: int,
@@ -658,10 +885,12 @@ def walk_stack_frames(
     module_ranges: list[tuple[int, int, str]],
     is_32bit: bool = False,
     exec_ranges: list[tuple[int, int]] | None = None,
+    pdata_tables: list[list[tuple[int, int, int]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Walk a thread's stack to extract return addresses and check module membership.
 
     Uses a hybrid approach:
+      0. Unwind-based walk (x64 only) — uses .pdata/.xdata for precise unwinding
       1. Frame pointer chain (RBP/EBP) — precise but breaks with -fomit-frame-pointer
       2. Stack scan fallback — scans stack as pointer array, checks executable ranges
 
@@ -673,6 +902,8 @@ def walk_stack_frames(
         is_32bit: True for x86, False for x64
         exec_ranges: Optional list of (start, end) for executable memory regions.
                      Used in scan mode to filter false positives.
+        pdata_tables: Optional list of parsed .pdata tables (from parse_pdata).
+                      Enables precise x64 unwind-based stack walking.
 
     Returns:
         List of return address entries:
@@ -711,6 +942,40 @@ def walk_stack_frames(
             return struct.unpack(ptr_fmt, data)[0]
         except Exception:
             return None
+
+    # ── Phase 0: Unwind-based walk (x64 only, requires .pdata) ──────────
+    if not is_32bit and pdata_tables:
+        try:
+            first_ret_data = reader.read(rsp, 8)
+            if len(first_ret_data) >= 8:
+                current_rip = struct.unpack("<Q", first_ret_data)[0]
+                current_rsp = rsp + 8
+
+                for _ in range(MAX_STACK_FRAMES):
+                    if current_rip <= 0x10000:
+                        break
+
+                    if current_rip not in seen_addrs:
+                        seen_addrs.add(current_rip)
+                        in_mod, mod_name = _addr_in_module(current_rip)
+                        results.append({
+                            "address": current_rip,
+                            "in_module": in_mod,
+                            "module_name": mod_name,
+                            "source": "unwind",
+                            "frame_depth": len(results),
+                        })
+
+                    frame_result = unwind_frame(reader, current_rip, current_rsp, pdata_tables)
+                    if frame_result is None:
+                        break
+                    current_rip, current_rsp = frame_result
+
+                if len(results) >= 3:
+                    # Unwind succeeded -- skip frame pointer and scan phases
+                    return results
+        except Exception:
+            pass  # Fall through to frame pointer walk
 
     # ── Phase 1: Frame pointer chain walk ────────────────────────────────
     frame_count = 0

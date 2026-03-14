@@ -425,6 +425,22 @@ def check_thread_stacks(
         except AttributeError:
             pass
 
+    # Build .pdata unwind tables for precise x64 stack walking
+    pdata_tables: list[list[tuple[int, int, int]]] = []
+    if not is_32bit:
+        from memdump_toolkit.pe_utils import parse_pdata
+        for mod in modules:
+            try:
+                base = mod.baseaddress
+                size = mod.size
+                # Read module from memory to parse .pdata
+                data = reader.read(base, min(size, 0x100000))  # Cap at 1MB for .pdata parsing
+                table = parse_pdata(data, base)
+                if table:
+                    pdata_tables.append(table)
+            except Exception:
+                continue
+
     try:
         threads = mf.threads.threads
     except AttributeError:
@@ -449,6 +465,7 @@ def check_thread_stacks(
             frames = walk_stack_frames(
                 reader, rsp, rbp, module_ranges,
                 is_32bit=is_32bit, exec_ranges=exec_ranges,
+                pdata_tables=pdata_tables,
             )
 
             # Find return addresses outside any known module

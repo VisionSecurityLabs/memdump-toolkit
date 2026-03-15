@@ -148,6 +148,40 @@ def full(dump, out_dir, verbose, yara_dir, auto_fetch, known_good_path):
     run(dump, out_dir, verbose, yara_dir, known_good=known_good)
 
 
+@cli.command()
+@click.argument("results_dir", type=click.Path(exists=True))
+def report(results_dir):
+    """Regenerate interactive HTML report from existing analysis output.
+
+    RESULTS_DIR is a directory containing JSON files from a previous
+    'full' pipeline run (binary_analysis.json, injection_report.json, etc.).
+    """
+    import json
+    import os
+    from memdump_toolkit.html_report import generate
+
+    def _load(name: str) -> Any:
+        path = os.path.join(results_dir, name)
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        return None
+
+    binary_results = _load("binary_analysis.json") or []
+    injection_report = _load("injection_report.json")
+    c2_results = _load("c2_hunt.json")
+    executive_data = _load("executive_summary.json")
+
+    if not binary_results and not injection_report and not c2_results:
+        raise click.ClickException(
+            f"No analysis JSON files found in {results_dir}. "
+            "Run 'memdump-toolkit full' first."
+        )
+
+    path = generate(results_dir, binary_results, c2_results, injection_report, executive_data)
+    click.echo(f"HTML report: {path}")
+
+
 @cli.command("fetch-rules")
 @click.option("--ruleset", "-r", "rulesets", multiple=True,
               help="Specific ruleset(s) to fetch (default: all)")

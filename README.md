@@ -129,6 +129,9 @@ memdump-toolkit c2-hunt dump.dmp -o ./c2
 memdump-toolkit config malware.dll -o ./config
 memdump-toolkit config dump.dmp --dump -o ./config
 
+# Regenerate HTML report from existing results
+memdump-toolkit report ./results
+
 # Fetch community YARA rulesets
 memdump-toolkit fetch-rules                     # download or update all 6 rulesets
 memdump-toolkit fetch-rules -r signature-base   # just one
@@ -144,6 +147,7 @@ memdump-toolkit fetch-rules --list              # show installed
 | **`binary_analysis.json`** | Full analysis per binary (universal + language-specific) |
 | **`iocs.csv`** | Flat IOC table (IP, URL, hash, pipe, tool) for SIEM ingestion |
 | **`executive_summary.json`** | Plain-English verdicts, MITRE ATT&CK mapping, recommended actions |
+| **`report.html`** | Interactive HTML report — dark theme, sortable tables, ATT&CK mapping (open in browser) |
 | `full_report.txt` | Human-readable report with executive summary and execution timeline |
 | `injection_report.json` | 9-check injection analysis |
 | `module_list.csv` | Listed module inventory (address, size, hashes, entropy) |

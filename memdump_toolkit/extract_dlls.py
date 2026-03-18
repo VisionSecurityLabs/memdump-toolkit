@@ -145,6 +145,9 @@ def extract_hidden_pes(
             "md5": hashes.get("md5", ""),
             "sha256": hashes.get("sha256", ""),
             "packed_sections": "|".join(packed),
+            "headerless": False,
+            "machine": "",
+            "machine_confirmed": "",
         })
 
     # Second pass: headerless PE recovery (MZ header zeroed out)

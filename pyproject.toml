@@ -5,7 +5,7 @@ description = "Memory dump forensic analysis toolkit for Windows Minidumps"
 authors = [{name = "Vision Security Labs"}]
 license = {text = "MIT"}
 requires-python = ">=3.10"
-dependencies = ["minidump", "pefile", "rapidfuzz", "rich", "click"]
+dependencies = ["minidump", "pefile", "rapidfuzz", "rich", "click", "pyyaml"]
 
 [project.optional-dependencies]
 yara = ["yara-python"]
@@ -28,3 +28,4 @@ dev = []
 
 [tool.hatch.build.targets.wheel]
 packages = ["memdump_toolkit"]
+include = ["memdump_toolkit/rulesets.default.yml", "memdump_toolkit/signatures.default.yml"]

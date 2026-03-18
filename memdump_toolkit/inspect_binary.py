@@ -388,7 +388,8 @@ def run(
     # ── Save JSON report if out_dir provided ─────────────────────────────────
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
-        report_path = os.path.join(out_dir, "inspect_report.json")
+        stem = os.path.splitext(os.path.basename(filepath))[0]
+        report_path = os.path.join(out_dir, f"inspect_{stem}.json")
         with open(report_path, "w") as fh:
             json.dump(result, fh, indent=2, default=str)
         print(f"JSON report: {report_path}")

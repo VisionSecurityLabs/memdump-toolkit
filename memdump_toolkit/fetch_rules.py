@@ -6,42 +6,49 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import shutil
+
 import click
 
 RULES_DIR = Path.home() / ".memdump-toolkit" / "rules"
+RULESETS_CONFIG = Path.home() / ".memdump-toolkit" / "rulesets.yml"
+_BUNDLED_DEFAULT = Path(__file__).parent / "rulesets.default.yml"
 
-RULESETS: dict[str, dict[str, str]] = {
-    "signature-base": {
-        "repo": "https://github.com/Neo23x0/signature-base.git",
-        "subdir": "yara",
-        "description": "Cobalt Strike, Go implants, webshells (Neo23x0)",
-    },
-    "yara-rules": {
-        "repo": "https://github.com/Yara-Rules/rules.git",
-        "subdir": ".",
-        "description": "Broad malware families, packers, exploits",
-    },
-    "gcti": {
-        "repo": "https://github.com/chronicle/GCTI.git",
-        "subdir": "YARA",
-        "description": "APT-focused, high quality (Google)",
-    },
-    "reversinglabs": {
-        "repo": "https://github.com/reversinglabs/reversinglabs-yara-rules.git",
-        "subdir": "yara",
-        "description": "Large malware family signature set",
-    },
-    "eset": {
-        "repo": "https://github.com/eset/malware-ioc.git",
-        "subdir": ".",
-        "description": "ESET research publications",
-    },
-    "elastic": {
-        "repo": "https://github.com/elastic/protections-artifacts.git",
-        "subdir": "yara/rules",
-        "description": "Elastic threat research",
-    },
-}
+
+def _write_default_config() -> None:
+    """Copy bundled default config to user directory on first run."""
+    RULESETS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(_BUNDLED_DEFAULT, RULESETS_CONFIG)
+
+
+def load_rulesets() -> dict[str, dict[str, str]]:
+    """Load rulesets from config file, copying defaults on first run.
+
+    Falls back to parsing the bundled default if PyYAML is not installed.
+    """
+    try:
+        import yaml
+    except ImportError:
+        with open(_BUNDLED_DEFAULT) as f:
+            return yaml.safe_load(f)  # type: ignore[name-defined]
+
+    if not RULESETS_CONFIG.exists():
+        _write_default_config()
+
+    try:
+        with open(RULESETS_CONFIG) as f:
+            data = yaml.safe_load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    with open(_BUNDLED_DEFAULT) as f:
+        return yaml.safe_load(f)
+
+
+# Module-level accessor — loaded once per process.
+RULESETS: dict[str, dict[str, str]] = load_rulesets()
 
 def resolve_yara_dir(yara_dir: str | None, auto_fetch: bool = False) -> str | None:
     """Resolve --yara-rules value.

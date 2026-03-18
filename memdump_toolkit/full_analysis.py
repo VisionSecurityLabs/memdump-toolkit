@@ -383,7 +383,6 @@ def generate_ioc_csv(
 def run(
     dump_path: str, out_dir: str | None = None,
     verbose: bool = False, yara_rules_dir: str | None = None,
-    known_good: set[str] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: parse dump once, run all modules, generate reports."""
     setup_logging(verbose)
@@ -427,6 +426,9 @@ def run(
 
         t2 = time.time()
         injection_report = detect_injection.analyze(mf, reader, out_dir)
+        inj_json_path = os.path.join(out_dir, "injection_report.json")
+        with open(inj_json_path, "w") as _f:
+            json.dump(injection_report, _f, indent=2, default=str)
         print(dim(f"\n  [Step 2 completed in {time.time()-t2:.1f}s]"))
 
         # Step 3: Universal Binary Analysis
@@ -439,7 +441,6 @@ def run(
         try:
             binary_results = analyze_binary.analyze(
                 mf, reader, out_dir, yara_rules_dir,
-                known_good=known_good,
             )
         except Exception as e:
             print(critical(f"  Binary analysis failed: {e}"))
@@ -524,6 +525,7 @@ def run(
             print(critical(f"  Executive summary failed: {e}"))
 
         # Interactive HTML Report
+        html_path = None
         try:
             from memdump_toolkit import html_report
             exec_data = None
@@ -531,10 +533,13 @@ def run(
             if os.path.exists(exec_json_path):
                 with open(exec_json_path) as f:
                     exec_data = json.load(f)
+            triage_data = None
+            if os.path.exists(triage_path):
+                with open(triage_path) as f:
+                    triage_data = json.load(f)
             html_path = html_report.generate(
-                out_dir, binary_results, c2_results, injection_report, exec_data,
+                out_dir, binary_results, c2_results, injection_report, exec_data, triage_data,
             )
-            print(dim(f"  HTML report: {html_path}"))
         except Exception as e:
             print(critical(f"  HTML report failed: {e}"))
 
@@ -554,7 +559,8 @@ def run(
                 print(dim(f"#   {rel:50s} {size:>12,} bytes"))
         print(banner(f"{'#'*80}"))
 
-    print(f"\nFull report saved: {report_path}")
+    if html_path:
+        print(f"\nHTML report: {html_path}")
 
     return {
         "injection_report": injection_report,

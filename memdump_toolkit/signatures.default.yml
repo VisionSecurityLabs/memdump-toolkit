@@ -1,0 +1,488 @@
+# memdump-toolkit detection signatures
+#
+# Bytes patterns: use double-quoted strings with \x escapes for binary data.
+# Example: "\xfc\x48\x83\xe4\xf0" for binary, "UPX0" for ASCII.
+#
+# Add new tools/signatures here — they are picked up on the next scan
+# without any code changes.
+#
+
+# ─── Known Go Offensive Tools ────────────────────────────────────────────────
+
+KNOWN_TOOLS:
+  chisel:
+    - "github.com/jpillora/chisel"
+    - "chisel/client"
+    - "chisel/server"
+  ligolo-ng:
+    - "github.com/nicocha30/ligolo"
+    - "ligolo-ng"
+  ligolo:
+    - "github.com/sysdream/ligolo"
+  sliver:
+    - "github.com/BishopFox/sliver"
+    - "sliverpb"
+    # Protobuf field names survive garble obfuscation
+    - "BeaconJitter"
+    - "GetBeaconJitter"
+    - "ReconfigureReq"
+  merlin:
+    - "github.com/Ne0nd0g/merlin"
+  gsocket:
+    - "github.com/nicknisi/gsocket"
+  frp:
+    - "github.com/fatedier/frp"
+  gost:
+    - "github.com/ginuerzh/gost"
+  rsockstun:
+    - "github.com/llkat/rsockstun"
+  revsocks:
+    - "github.com/kost/revsocks"
+  venom:
+    - "github.com/Dliv3/Venom"
+  stowaway:
+    - "github.com/ph4ntonn/Stowaway"
+  iox:
+    - "github.com/EddieIvan01/iox"
+  rakshasa:
+    - "github.com/Mob2003/rakshasa"
+  pspy:
+    - "github.com/DominicBreuker/pspy"
+  garble:
+    - "mvdan.cc/garble"
+  gobuster:
+    - "github.com/OJ/gobuster"
+  ffuf:
+    - "github.com/ffuf/ffuf"
+  nuclei:
+    - "github.com/projectdiscovery/nuclei"
+  naabu:
+    - "github.com/projectdiscovery/naabu"
+  subfinder:
+    - "github.com/projectdiscovery/subfinder"
+  httpx:
+    - "github.com/projectdiscovery/httpx"
+
+
+# ─── Capability Detection (Two-Tier) ────────────────────────────────────────
+
+# Tier 1: High-confidence — single match in raw bytes is sufficient
+CAPABILITY_STRONG:
+  socks_proxy:
+    - "socks5h://"
+    - "socks4://"
+    - "socksAuth"
+    - "SOCKS5Connect"
+  credential_theft:
+    - "mimikatz"
+    - "sekurlsa"
+    - "logonPasswords"
+  encryption:
+    - "chacha20"
+    - "poly1305"
+    - "hkdf"
+  c2_websocket:
+    - "nhooyr.io/websocket"
+    - "gorilla/websocket"
+  multiplexing:
+    - "yamux"
+    - "hashicorp/yamux"
+  kerberos:
+    - "sspi/kerberos"
+    - "KerberosSSP"
+  ntlm:
+    - "sspi/ntlm"
+    - "NTLMSSP"
+  smb:
+    - "SMBSession"
+    - "buildSMB"
+    - "parseSMB"
+  ldap:
+    - "parseLDAP"
+    - "ldap.Conn"
+  icmp:
+    - "IcmpReq"
+    - "icmp.Message"
+  pivot:
+    - "PivotStart"
+    - "PivotStop"
+
+# Tier 2: Generic — require 2+ matches within extracted strings
+CAPABILITY_WEAK:
+  reverse_shell:
+    - "reverse_shell"
+    - "cmd.exe"
+    - "/bin/sh"
+    - "/bin/bash"
+  port_forwarding:
+    - "portfwd"
+    - "portforward"
+    - "tunnel"
+  persistence:
+    - "RegCreateKeyEx"
+    - "schtasks"
+    - "CreateService"
+  c2_http:
+    - "beacon"
+    - "callback"
+    - "checkin"
+  c2_dns:
+    - "dnscat"
+    - "dns.Msg"
+    - "dnsTunnel"
+  named_pipes:
+    - "\\\\.\\pipe\\"
+  lateral_movement:
+    - "psexec"
+    - "winrm"
+    - "WMIExec"
+
+
+# ─── Universal Binary Analysis (Language-Agnostic) ──────────────────────────
+
+# Packer/crypter artifact signatures (section names and header strings)
+# In memory dumps, binaries are UNPACKED — we detect leftover artifacts.
+PACKER_SIGNATURES:
+  UPX:
+    - "UPX0"
+    - "UPX1"
+    - "UPX!"
+    - "UPX2"
+  Themida:
+    - "Themida"
+    - ".themida"
+    - "Oreans"
+  VMProtect:
+    - ".vmp0"
+    - ".vmp1"
+    - "VMProtect"
+  ASPack:
+    - ".aspack"
+    - ".adata"
+    - "ASPack"
+  MPRESS:
+    - ".MPRESS1"
+    - ".MPRESS2"
+  Enigma:
+    - ".enigma1"
+    - ".enigma2"
+    - "Enigma protector"
+  PECompact:
+    - "PECompact2"
+    - "PEC2"
+  Armadillo:
+    - "Armadillo"
+    - ".text1\x00"
+  Obsidium:
+    - "Obsidium"
+    - ".obsidium"
+  NSPack:
+    - ".nsp0"
+    - ".nsp1"
+    - "nsPack"
+
+# Language identification signatures
+LANG_SIGNATURES:
+  rust:
+    - "panicked at"
+    - "rust_begin_unwind"
+    - "/rustc/"
+    - ".cargo/registry"
+    - "core::panicking"
+    - "core::fmt::write"
+    - "alloc::raw_vec"
+    - "std::rt::lang_start"
+  delphi:
+    - "TObject\x00"
+    - "Borland C++ -"
+    - "Embarcadero"
+    - "TForm\x00"
+    - "System.SysUtils"
+    - "Classes.TComponent"
+  nim:
+    - "@nimMain"
+    - "stdlib_system"
+    - "Nim/lib/"
+    - "nimbase.h"
+    - "NimMainModule"
+    - "NimMainInner"
+# Go and .NET are detected via structural checks (score-based / CLR header),
+# not string signatures. These cover languages without structural markers.
+
+
+# ─── .NET Suspicious Patterns ──────────────────────────────────────────────
+
+# Known .NET obfuscator/packer signatures
+DOTNET_OBFUSCATORS:
+  ConfuserEx:
+    - "ConfuserEx"
+    - "Confuser.Core"
+    - "Confuser.Runtime"
+  NET_Reactor:
+    - ".NET Reactor"
+    - "ReactorHelper"
+    - "NETReactor"
+  SmartAssembly:
+    - "SmartAssembly"
+    - "{SmartAssembly}"
+    - "PoweredByAttribute"
+  Dotfuscator:
+    - "Dotfuscator"
+    - "PreEmptive"
+  Babel_NET:
+    - "Babel.Net"
+    - "babelfor.net"
+  Eazfuscator:
+    - "Eazfuscator.NET"
+    - "\xef\xbb\xbfEaz"
+  Crypto_Obfuscator:
+    - "CryptoObfuscator"
+    - "Crypto Obfuscator"
+  Agile_NET:
+    - "Agile.NET"
+    - "CliSecure"
+  ILProtector:
+    - "ILProtector"
+    - "ILProt"
+  De4dot_marker:
+    - "de4dot"
+    - "Deobfuscated"
+
+# Known .NET offensive tools / frameworks
+DOTNET_OFFENSIVE_TOOLS:
+  Cobalt_Strike_BOF_NET:
+    - "BOF.NET"
+    - "BeaconObject"
+  SharpHound:
+    - "SharpHound"
+    - "BloodHound"
+    - "Sharphound.Client"
+  Rubeus:
+    - "Rubeus"
+    - "Roast"
+    - "asktgt"
+    - "asktgs"
+  Seatbelt:
+    - "Seatbelt"
+    - "GhostPack"
+  SharpUp:
+    - "SharpUp"
+    - "PrivescCheck"
+  Certify:
+    - "Certify"
+    - "ForgeCert"
+  SharpDPAPI:
+    - "SharpDPAPI"
+    - "SharpChrome"
+  SharpView:
+    - "SharpView"
+    - "PowerView"
+  SharpWMI:
+    - "SharpWMI"
+  SafetyKatz:
+    - "SafetyKatz"
+    - "sekurlsa"
+  SharpSecDump:
+    - "SharpSecDump"
+  Covenant:
+    - "Covenant"
+    - "GruntStager"
+    - "GruntHTTP"
+  SharpSploit:
+    - "SharpSploit"
+  SharpC2:
+    - "SharpC2"
+    - "DroneModule"
+  SilverC2:
+    - "SilverC2"
+  PoshC2:
+    - "PoshC2"
+    - "poshc2"
+  Invoke_Assembly:
+    - "InvokeAssembly"
+    - "ExecuteAssembly"
+
+
+# ─── Shellcode Detection ────────────────────────────────────────────────────
+
+# Known shellcode prologues (first bytes of common payloads)
+# SHELLCODE_PROLOGUES: each value is a single bytes pattern
+SHELLCODE_PROLOGUES:
+  # Cobalt Strike beacon (x64): cld; and rsp, -10h; call $+5
+  CobaltStrike_x64: "\xfc\x48\x83\xe4\xf0"
+  # Cobalt Strike beacon (x86): cld; call $+5
+  CobaltStrike_x86: "\xfc\xe8"
+  # Metasploit reverse_tcp (x64): cld; and rsp, -10h; mov r14, ...
+  Metasploit_x64: "\xfc\x48\x83\xe4\xf0\xe8"
+  # Metasploit reverse_tcp (x86): cld; call dword [ebp+...]
+  Metasploit_x86: "\xfc\xe8\x82\x00\x00\x00"
+  # Generic x64 sub rsp, N prologue (common in custom shellcode)
+  Generic_x64_sub_rsp: "\x48\x83\xec"
+  # msfvenom shikata_ga_nai decoder stub
+  Shikata_ga_nai: "\xd9\x74\x24\xf4"
+
+# Byte patterns to search within RWX regions (not just at offset 0)
+# SHELLCODE_PATTERNS: each value has pattern + description
+SHELLCODE_PATTERNS:
+  # PEB access (x64): mov rax, gs:[0x60]
+  PEB_access_x64:
+    pattern: "\x65\x48\x8b\x04\x25\x60\x00\x00\x00"
+    description: "GS:[0x60] PEB access (x64)"
+  # PEB access (x86): mov eax, fs:[0x30]
+  PEB_access_x86:
+    pattern: "\x64\xa1\x30\x00\x00\x00"
+    description: "FS:[0x30] PEB access (x86)"
+  # PEB_LDR_DATA access (x64): mov rax, [rax+0x18]
+  PEB_LDR_x64:
+    pattern: "\x48\x8b\x40\x18"
+    description: "PEB->Ldr (x64)"
+  # Hash-based API resolution: ror edi, 0xD (common in shellcode)
+  API_hash_ror13:
+    pattern: "\xc1\xcf\x0d"
+    description: "ROR EDI,0xD API hashing"
+  # NtAllocateVirtualMemory syscall stub pattern
+  Syscall_stub:
+    pattern: "\x0f\x05\xc3"
+    description: "syscall; ret (direct syscall)"
+  # VirtualAlloc / VirtualProtect call setup (common in loaders)
+  WinExec_hash:
+    pattern: "\x68\x72\xfe\xb3\x16"
+    description: "WinExec hash push (CRC32)"
+
+# NOP sled variants (sliding window detection)
+NOP_PATTERNS:
+  - "\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90"
+  - "\x0f\x1f\x00\x0f\x1f\x00\x0f\x1f\x00\x0f\x1f\x00\x0f\x1f\x00"
+  - "\x0f\x1f\x40\x00\x0f\x1f\x40\x00\x0f\x1f\x40\x00\x0f\x1f\x40\x00"
+  - "\x66\x90\x66\x90\x66\x90\x66\x90\x66\x90\x66\x90\x66\x90\x66\x90"
+
+
+# ─── Suspicious PE Imports ───────────────────────────────────────────────────
+
+# String-only signatures (no bytes conversion needed)
+SUSPICIOUS_IMPORTS:
+  process_injection:
+    - "VirtualAllocEx"
+    - "WriteProcessMemory"
+    - "CreateRemoteThread"
+    - "NtQueueApcThread"
+    - "NtWriteVirtualMemory"
+    - "RtlCreateUserThread"
+    - "NtCreateThreadEx"
+    - "NtMapViewOfSection"
+    - "NtUnmapViewOfSection"
+  code_loading:
+    - "LoadLibraryA"
+    - "LoadLibraryW"
+    - "LoadLibraryExA"
+    - "LoadLibraryExW"
+    - "LdrLoadDll"
+    - "GetProcAddress"
+  memory_manipulation:
+    - "VirtualAlloc"
+    - "VirtualProtect"
+    - "VirtualProtectEx"
+    - "NtAllocateVirtualMemory"
+    - "NtProtectVirtualMemory"
+  credential_access:
+    - "OpenProcess"
+    - "MiniDumpWriteDump"
+    - "LsaLogonUser"
+    - "CredEnumerateA"
+    - "CredEnumerateW"
+
+# P/Invoke targets that indicate offensive capability
+DOTNET_SUSPICIOUS_PINVOKE:
+  process_injection:
+    - "VirtualAllocEx"
+    - "WriteProcessMemory"
+    - "CreateRemoteThread"
+    - "NtWriteVirtualMemory"
+    - "RtlCreateUserThread"
+    - "NtCreateThreadEx"
+    - "QueueUserAPC"
+    - "NtQueueApcThread"
+  memory_manipulation:
+    - "VirtualAlloc"
+    - "VirtualProtect"
+    - "VirtualProtectEx"
+    - "NtAllocateVirtualMemory"
+    - "NtProtectVirtualMemory"
+  code_loading:
+    - "LoadLibrary"
+    - "LoadLibraryA"
+    - "LoadLibraryW"
+    - "GetProcAddress"
+    - "LdrLoadDll"
+  credential_access:
+    - "OpenProcess"
+    - "MiniDumpWriteDump"
+    - "LsaLogonUser"
+    - "CredEnumerate"
+    - "OpenProcessToken"
+    - "DuplicateTokenEx"
+  evasion:
+    - "NtSetInformationThread"
+    - "CheckRemoteDebuggerPresent"
+    - "IsDebuggerPresent"
+    - "AmsiScanBuffer"
+    - "EtwEventWrite"
+
+# Suspicious .NET API usage patterns (type/method names in metadata or strings)
+DOTNET_SUSPICIOUS_APIS:
+  reflective_loading:
+    - "Assembly.Load"
+    - "Assembly.LoadFrom"
+    - "Assembly.LoadFile"
+    - "Assembly.ReflectionOnlyLoad"
+    - "AppDomain.Load"
+  dynamic_code:
+    - "Reflection.Emit"
+    - "DynamicMethod"
+    - "TypeBuilder"
+    - "MethodBuilder"
+    - "ILGenerator"
+    - "CompileAssemblyFromSource"
+  process_execution:
+    - "Process.Start"
+    - "ProcessStartInfo"
+    - "WmiObject"
+    - "ManagementClass"
+    - "Win32_Process"
+  network_comms:
+    - "WebClient"
+    - "HttpClient"
+    - "WebRequest"
+    - "HttpWebRequest"
+    - "TcpClient"
+    - "TcpListener"
+    - "Socket"
+    - "UdpClient"
+  memory_access:
+    - "Marshal.Copy"
+    - "Marshal.AllocHGlobal"
+    - "Marshal.PtrToStructure"
+    - "Marshal.ReadByte"
+    - "Marshal.WriteByte"
+    - "GCHandle"
+    - "Marshal.GetDelegateForFunctionPointer"
+  crypto:
+    - "AesManaged"
+    - "AesCryptoServiceProvider"
+    - "RijndaelManaged"
+    - "RSACryptoServiceProvider"
+    - "DESCryptoServiceProvider"
+    - "TripleDES"
+    - "RC2CryptoServiceProvider"
+  persistence:
+    - "RegistryKey"
+    - "Registry.SetValue"
+    - "Registry.CurrentUser"
+    - "TaskScheduler"
+    - "ServiceInstaller"
+    - "ServiceBase"
+  anti_analysis:
+    - "Debugger.IsAttached"
+    - "IsDebuggerPresent"
+    - "CheckRemoteDebuggerPresent"
+    - "Environment.StackTrace"

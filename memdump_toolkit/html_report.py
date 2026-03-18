@@ -71,10 +71,12 @@ def _score_bar(score: int) -> str:
 def _build_nav() -> str:
     """Sticky sidebar navigation."""
     links = [
+        ("executive", "Executive Summary"),
         ("dashboard", "Dashboard"),
         ("binaries", "Binaries"),
         ("injection", "Injection"),
         ("c2", "C2 Indicators"),
+        ("yara", "YARA"),
         ("attack", "ATT&CK"),
         ("iocs", "IOCs"),
     ]
@@ -82,13 +84,74 @@ def _build_nav() -> str:
         f'        <a href="#{_esc(href)}" class="nav-link">{_esc(label)}</a>'
         for href, label in links
     )
-    return f'<nav id="sidebar">\n    <div class="nav-title">memdump-toolkit</div>\n{items}\n</nav>'
+    return (
+        f'<nav id="sidebar">\n'
+        f'    <div class="nav-title">memdump-toolkit</div>\n'
+        f'    <div class="nav-brand">Vision Security Labs</div>\n'
+        f'{items}\n</nav>'
+    )
+
+
+def _build_executive_section(executive_data: dict | None) -> str:
+    """Build executive summary section with verdicts and recommended actions."""
+    if not executive_data:
+        return '<section id="executive"><h2>Executive Summary</h2><p class="dim">No executive summary available.</p></section>'
+
+    parts: list[str] = []
+
+    # Verdicts
+    verdicts = executive_data.get("verdicts", [])
+    if verdicts:
+        rows = ""
+        for v in verdicts:
+            fname = _esc(Path(v.get("file", "unknown")).name)
+            score = v.get("risk_score", 0)
+            lang = _esc(v.get("language") or "native")
+            verdict_text = _esc(v.get("verdict", ""))
+            rows += f"""
+                <tr>
+                    <td>{fname}</td>
+                    <td>{lang}</td>
+                    <td data-sort="{score}">{_score_bar(score)}</td>
+                    <td>{_badge(_severity_label(score))}</td>
+                    <td>{verdict_text}</td>
+                </tr>"""
+        parts.append(f"""
+        <h3>Threat Verdicts</h3>
+        <div class="table-wrap">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Binary</th>
+                        <th>Language</th>
+                        <th>Risk Score</th>
+                        <th>Severity</th>
+                        <th>Verdict</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>""")
+
+    # Recommended actions
+    actions = executive_data.get("recommended_actions", [])
+    if actions:
+        items = "".join(f"<li>{_esc(a)}</li>" for a in actions)
+        parts.append(f'<h3>Recommended Actions</h3><ul class="action-list">{items}</ul>')
+
+    content = "\n".join(parts)
+    return f"""
+    <section id="executive">
+        <h2>Executive Summary</h2>
+        {content}
+    </section>"""
 
 
 def _build_dashboard(
     binary_results: list[dict],
     injection_report: dict | None,
     c2_results: dict | None,
+    triage_data: dict | None,
 ) -> str:
     """Build dashboard summary cards."""
     total_binaries = len(binary_results)
@@ -100,10 +163,19 @@ def _build_dashboard(
         for key in ("urls", "hostnames", "ip_ports", "private_keys", "named_pipes"):
             ioc_count += len(c2_results.get(key, []))
 
+    # Pull injection totals from triage stats when available
+    inj_total = 0
+    if triage_data:
+        inj_stats = triage_data.get("statistics", {}).get("injection", {})
+        inj_total = sum(inj_stats.get("by_severity", {}).values())
+    elif injection_report:
+        inj_total = len(injection_report.get("findings", []))
+
     cards = [
         ("Total Binaries", str(total_binaries), "var(--accent)"),
-        ("Critical", str(critical_count), "var(--critical)"),
-        ("High", str(high_count), "var(--high)"),
+        ("Injection Findings", str(inj_total), "var(--critical)"),
+        ("Critical Binaries", str(critical_count), "var(--critical)"),
+        ("High Binaries", str(high_count), "var(--high)"),
         ("IOCs Found", str(ioc_count), "var(--medium)"),
     ]
 
@@ -132,13 +204,49 @@ def _build_dashboard(
                 f' title="{_esc(label)}: {count}">{count}</div>'
             )
 
+    # Triage statistics table
+    triage_stats_html = ""
+    if triage_data:
+        stats = triage_data.get("statistics", {})
+        rows = ""
+        inj = stats.get("injection", {})
+        if inj:
+            by_sev = inj.get("by_severity", {})
+            by_type = inj.get("by_type", {})
+            rows += f"<tr><td>Injection — Critical</td><td>{_esc(by_sev.get('CRITICAL', 0))}</td></tr>"
+            rows += f"<tr><td>Injection — High</td><td>{_esc(by_sev.get('HIGH', 0))}</td></tr>"
+            rows += f"<tr><td>Injection — Medium</td><td>{_esc(by_sev.get('MEDIUM', 0))}</td></tr>"
+            rows += f"<tr><td>Injection — Low</td><td>{_esc(by_sev.get('LOW', 0))}</td></tr>"
+            for t, cnt in by_type.items():
+                rows += f"<tr><td>Injection type: {_esc(t)}</td><td>{_esc(cnt)}</td></tr>"
+        ba = stats.get("binary_analysis", {})
+        if ba:
+            rows += f"<tr><td>Binaries analyzed</td><td>{_esc(ba.get('total_analyzed', 0))}</td></tr>"
+            for lang, cnt in ba.get("by_language", {}).items():
+                rows += f"<tr><td>Language: {_esc(lang)}</td><td>{_esc(cnt)}</td></tr>"
+        c2s = stats.get("c2_hunt", {})
+        if c2s:
+            rows += f"<tr><td>C2 — Segments scanned</td><td>{_esc(c2s.get('segments_scanned', 0))}</td></tr>"
+            rows += f"<tr><td>C2 — Bytes scanned</td><td>{c2s.get('bytes_scanned', 0):,}</td></tr>"
+            rows += f"<tr><td>C2 — Private keys found</td><td>{_esc(c2s.get('private_keys_found', 0))}</td></tr>"
+            rows += f"<tr><td>C2 — Certificates found</td><td>{_esc(c2s.get('certificates_found', 0))}</td></tr>"
+        if rows:
+            triage_stats_html = f"""
+        <h3>Analysis Statistics</h3>
+        <div class="table-wrap">
+            <table class="data-table stats-table">
+                <thead><tr><th>Metric</th><th>Count</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>"""
+
     return f"""
     <section id="dashboard">
         <h2>Dashboard</h2>
         <div class="card-grid">
 {card_html}
         </div>
-        <h3>Severity Distribution</h3>
+        <h3>Binary Severity Distribution</h3>
         <div class="dist-bar">{bar_segments}</div>
         <div class="dist-legend">
             <span><span class="dot" style="background:var(--critical)"></span>Critical</span>
@@ -146,6 +254,7 @@ def _build_dashboard(
             <span><span class="dot" style="background:var(--medium)"></span>Medium</span>
             <span><span class="dot" style="background:var(--low)"></span>Low</span>
         </div>
+        {triage_stats_html}
     </section>"""
 
 
@@ -192,6 +301,14 @@ def _build_binary_detail(r: dict) -> str:
     go = r.get("go_analysis", {})
     if go:
         go_parts: list[str] = []
+        # Module metadata
+        meta_rows = ""
+        for field, label in (("module_path", "Module"), ("go_version", "Go Version"), ("binary_type", "Type")):
+            val = go.get(field)
+            if val:
+                meta_rows += f"<tr><td>{label}</td><td class='mono'>{_esc(val)}</td></tr>"
+        if meta_rows:
+            go_parts.append(f"<table class='detail-table'>{meta_rows}</table>")
         if go.get("known_tools"):
             go_parts.append(f"<p><strong>Known Tools:</strong> {_esc(', '.join(go['known_tools']))}</p>")
         caps = go.get("capabilities", {})
@@ -201,6 +318,21 @@ def _build_binary_detail(r: dict) -> str:
         elif isinstance(caps, list) and caps:
             cap_items = "".join(f"<li>{_esc(c)}</li>" for c in caps)
             go_parts.append(f"<p><strong>Capabilities:</strong></p><ul>{cap_items}</ul>")
+        deps = go.get("dependencies", [])
+        if deps:
+            li = "".join(f"<li class='mono'>{_esc(d)}</li>" for d in deps)
+            go_parts.append(f"<p><strong>Dependencies ({len(deps)}):</strong></p><ul>{li}</ul>")
+        src = go.get("source_files", [])
+        if src:
+            li = "".join(f"<li class='mono'>{_esc(s)}</li>" for s in src)
+            go_parts.append(f"<p><strong>Source Files ({len(src)}):</strong></p><ul>{li}</ul>")
+        by_pkg = go.get("functions_by_package", {})
+        if by_pkg:
+            pkg_rows = "".join(
+                f"<tr><td class='mono'>{_esc(pkg)}</td><td>{len(fns)}</td></tr>"
+                for pkg, fns in sorted(by_pkg.items())
+            )
+            go_parts.append(f"<p><strong>Functions by Package:</strong></p><table class='detail-table'>{pkg_rows}</table>")
         net_iocs = go.get("network_iocs", {})
         if net_iocs:
             for key in ("urls", "named_pipes"):
@@ -230,19 +362,46 @@ def _build_binary_detail(r: dict) -> str:
         if dn_parts:
             parts.append(f"<div class='detail-block'><h4>.NET Analysis</h4>{''.join(dn_parts)}</div>")
 
-    # Config extraction
+    # Config extraction — render all sub-sections
     config = r.get("config", {})
     if config:
-        net_cfg = config.get("network", {})
         cfg_parts: list[str] = []
-        for key in ("urls", "ips", "hostnames", "named_pipes"):
-            items = net_cfg.get(key, [])
-            if items:
-                if key == "ips":
-                    li = "".join(f"<li class='mono'>{_esc(i.get('ip', i) if isinstance(i, dict) else i)}</li>" for i in items)
-                else:
-                    li = "".join(f"<li class='mono'>{_esc(i)}</li>" for i in items)
-                cfg_parts.append(f"<p><strong>{_esc(key)}:</strong></p><ul>{li}</ul>")
+
+        def _cfg_list(label: str, items: list) -> str:
+            if not items:
+                return ""
+            li = "".join(
+                f"<li class='mono'>{_esc(i.get('ip', i) if isinstance(i, dict) else i)}</li>"
+                for i in items
+            )
+            return f"<p><strong>{_esc(label)}:</strong></p><ul>{li}</ul>"
+
+        # Network
+        net = config.get("network", {})
+        for key in ("urls", "ips", "hostnames", "ip_ports", "named_pipes", "unc_paths", "ports"):
+            block = _cfg_list(key, net.get(key, []))
+            if block:
+                cfg_parts.append(block)
+
+        # C2 indicators
+        c2cfg = config.get("c2", {})
+        for key in ("http_headers", "user_agents", "timing_strings", "embedded_json"):
+            block = _cfg_list(key, c2cfg.get(key, []))
+            if block:
+                cfg_parts.append(block)
+
+        # Crypto artefacts
+        crypto = config.get("crypto", {})
+        for key in ("possible_hex_keys", "fingerprints", "pem_certificates", "base64_blobs"):
+            block = _cfg_list(key, crypto.get(key, []))
+            if block:
+                cfg_parts.append(block)
+
+        # FlatBuffers schema types
+        fb_types = config.get("flatbuffers", {}).get("flatbuffers_types", [])
+        if fb_types:
+            cfg_parts.append(_cfg_list("flatbuffers_types", fb_types))
+
         if cfg_parts:
             parts.append(f"<div class='detail-block'><h4>Extracted Config</h4>{''.join(cfg_parts)}</div>")
 
@@ -268,9 +427,7 @@ def _build_binary_table(binary_results: list[dict]) -> str:
         score = r.get("risk_score", 0)
         sev = _severity_label(score)
         factors = r.get("risk_factors", [])
-        factors_str = _esc(", ".join(factors[:3]))
-        if len(factors) > 3:
-            factors_str += f" (+{len(factors) - 3})"
+        factors_str = _esc(", ".join(factors))
 
         rows += f"""
             <tr class="summary-row" data-idx="{idx}" onclick="toggleDetail({idx})">
@@ -325,7 +482,7 @@ def _build_injection_section(injection_report: dict | None) -> str:
         for k, v in f.items():
             if k not in ("type", "severity", "module", "base", "identity"):
                 detail_parts.append(f"{_esc(k)}: {_esc(v)}")
-        details = _esc("; ".join(detail_parts[:5]))
+        details = "; ".join(detail_parts)
 
         rows += f"""
             <tr>
@@ -333,7 +490,7 @@ def _build_injection_section(injection_report: dict | None) -> str:
                 <td>{_badge(sev)}</td>
                 <td>{module}</td>
                 <td class="mono">{base}</td>
-                <td class="truncate">{details}</td>
+                <td>{details}</td>
             </tr>"""
 
     return f"""
@@ -357,10 +514,25 @@ def _build_injection_section(injection_report: dict | None) -> str:
     </section>"""
 
 
-def _build_c2_section(c2_results: dict | None) -> str:
+def _build_c2_section(c2_results: dict | None, executive_data: dict | None = None) -> str:
     """Build C2 indicators section."""
     if not c2_results:
         return '<section id="c2"><h2>C2 Indicators</h2><p class="dim">No C2 indicators found.</p></section>'
+
+    # Build value → source binary lookup from executive_data["c2_by_binary"].
+    # Only attribute when we have a real binary name — raw memory hits are unattributable.
+    _source: dict[str, str] = {}
+    if executive_data:
+        for binary, indicators in executive_data.get("c2_by_binary", {}).items():
+            if binary == "(process memory)":
+                continue
+            label = Path(binary).name
+            for ind in indicators:
+                _source[ind.get("value", "")] = label
+
+    def _src_cell(val: str) -> str:
+        src = _source.get(val, "")
+        return f"<td class='dim'>{_esc(src)}</td>" if src else "<td class='dim'></td>"
 
     sections: list[str] = []
 
@@ -371,16 +543,16 @@ def _build_c2_section(c2_results: dict | None) -> str:
         rows = ""
         for entry in items:
             if isinstance(entry, dict):
-                val = _esc(entry.get(value_key, str(entry)))
+                val = entry.get(value_key, str(entry))
                 count = entry.get("count", "")
-                rows += f"<tr><td class='mono'>{val}</td><td>{_esc(count)}</td></tr>"
+                rows += f"<tr><td class='mono'>{_esc(val)}</td><td>{_esc(count)}</td>{_src_cell(val)}</tr>"
             else:
-                rows += f"<tr><td class='mono'>{_esc(entry)}</td><td></td></tr>"
+                rows += f"<tr><td class='mono'>{_esc(entry)}</td><td></td><td></td></tr>"
         return f"""
         <div class="c2-group">
             <h3>{_esc(title)}</h3>
             <table class="data-table">
-                <thead><tr><th>Value</th><th>Count</th></tr></thead>
+                <thead><tr><th>Value</th><th>Count</th><th>Source</th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
         </div>"""
@@ -392,9 +564,30 @@ def _build_c2_section(c2_results: dict | None) -> str:
     # Private keys
     keys = c2_results.get("private_keys", [])
     if keys:
+        key_rows = ""
+        for k in keys:
+            addr = _esc(hex(k["address"]) if isinstance(k.get("address"), int) else k.get("address", ""))
+            pem = k.get("pem", "")
+            key_rows += f"<tr><td class='mono'>{addr}</td><td class='mono cert-pem'>{_esc(pem)}</td></tr>"
         sections.append(
-            f'<div class="c2-group"><h3>Private Keys</h3>'
-            f'<p class="critical-text">{_esc(len(keys))} private key(s) found in process memory</p></div>'
+            f'<div class="c2-group"><h3>Private Keys ({len(keys)})</h3>'
+            f'<p class="critical-text" style="margin-bottom:8px">{len(keys)} private key(s) found in process memory</p>'
+            f'<table class="data-table"><thead><tr><th>Address</th><th>PEM</th></tr></thead>'
+            f'<tbody>{key_rows}</tbody></table></div>'
+        )
+
+    # Certificates
+    certs = c2_results.get("certificates", [])
+    if certs:
+        cert_rows = ""
+        for cert in certs:
+            addr = _esc(hex(cert["address"]) if isinstance(cert.get("address"), int) else cert.get("address", ""))
+            pem = cert.get("pem", "")
+            cert_rows += f"<tr><td class='mono'>{addr}</td><td class='mono cert-pem'>{_esc(pem)}</td></tr>"
+        sections.append(
+            f'<div class="c2-group"><h3>Certificates ({len(certs)})</h3>'
+            f'<table class="data-table"><thead><tr><th>Address</th><th>PEM</th></tr></thead>'
+            f'<tbody>{cert_rows}</tbody></table></div>'
         )
 
     # User agents
@@ -402,11 +595,11 @@ def _build_c2_section(c2_results: dict | None) -> str:
     if uas:
         ua_rows = ""
         for entry in uas:
-            val = _esc(entry.get("value", "")[:200]) if isinstance(entry, dict) else _esc(str(entry)[:200])
-            ua_rows += f"<tr><td class='mono truncate'>{val}</td></tr>"
+            val = entry.get("value", "") if isinstance(entry, dict) else str(entry)
+            ua_rows += f"<tr><td class='mono'>{_esc(val)}</td>{_src_cell(val)}</tr>"
         sections.append(
             f'<div class="c2-group"><h3>User Agents</h3>'
-            f'<table class="data-table"><thead><tr><th>Value</th></tr></thead>'
+            f'<table class="data-table"><thead><tr><th>Value</th><th>Source</th></tr></thead>'
             f'<tbody>{ua_rows}</tbody></table></div>'
         )
 
@@ -415,6 +608,42 @@ def _build_c2_section(c2_results: dict | None) -> str:
     <section id="c2">
         <h2>C2 Indicators</h2>
         {content}
+    </section>"""
+
+
+def _build_yara_section(binary_results: list[dict]) -> str:
+    """Build YARA hits section aggregated across all binaries."""
+    hits: list[tuple[str, str]] = []  # (binary_name, rule_name)
+    for r in binary_results:
+        fname = Path(r.get("file", "unknown")).name
+        for match in r.get("yara_matches", []):
+            hits.append((fname, match))
+
+    if not hits:
+        return '<section id="yara"><h2>YARA Matches</h2><p class="dim">No YARA matches found (run with --yara to enable).</p></section>'
+
+    rows = ""
+    for fname, rule in hits:
+        rows += f"""
+            <tr>
+                <td class="mono">{_esc(rule)}</td>
+                <td>{_esc(fname)}</td>
+            </tr>"""
+
+    return f"""
+    <section id="yara">
+        <h2>YARA Matches ({len(hits)})</h2>
+        <div class="table-wrap">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Rule</th>
+                        <th>Binary</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
     </section>"""
 
 
@@ -540,7 +769,7 @@ def _build_ioc_section(
         rows += f"""
             <tr>
                 <td>{_badge(ioc_type)}</td>
-                <td class="mono truncate" id="ioc-val-{idx}">{_esc(ioc_val)}</td>
+                <td class="mono" id="ioc-val-{idx}">{_esc(ioc_val)}</td>
                 <td>{_esc(ioc_src)}</td>
                 <td><button class="copy-btn" onclick="copyIOC({idx})">Copy</button></td>
             </tr>"""
@@ -621,6 +850,15 @@ body {
     border-bottom: 1px solid var(--border);
     margin-bottom: 8px;
     font-family: var(--font-mono);
+}
+
+.nav-brand {
+    font-size: 10px;
+    color: var(--text-secondary);
+    padding: 0 20px 12px;
+    font-family: var(--font-mono);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
 }
 
 .nav-link {
@@ -895,12 +1133,34 @@ section h3 {
 /* Utility */
 .mono { font-family: var(--font-mono); font-size: 12px; }
 .dim { color: var(--text-secondary); }
-.truncate {
-    max-width: 400px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+.cert-pem {
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 11px;
+    max-width: 600px;
 }
+
+/* Stats table (narrow) */
+.stats-table { max-width: 420px; }
+.stats-table td:last-child { font-family: var(--font-mono); font-weight: 700; text-align: right; }
+
+/* Executive summary */
+.action-list {
+    list-style: none;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.action-list li {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--high);
+    border-radius: 4px;
+    padding: 8px 14px;
+    font-size: 13px;
+}
+.action-list li::before { content: none; }
 
 /* Footer */
 .report-footer {
@@ -1037,6 +1297,8 @@ def generate(
     c2_results: dict | None = None,
     injection_report: dict | None = None,
     executive_data: dict | None = None,
+    triage_data: dict | None = None,
+    report_name: str = "report.html",
 ) -> str:
     """Generate interactive HTML report.
 
@@ -1056,10 +1318,12 @@ def generate(
         dump_name = Path(injection_report["dump"]).name
 
     nav = _build_nav()
-    dashboard = _build_dashboard(binary_results, injection_report, c2_results)
+    executive = _build_executive_section(executive_data)
+    dashboard = _build_dashboard(binary_results, injection_report, c2_results, triage_data)
     binaries = _build_binary_table(binary_results)
     injection = _build_injection_section(injection_report)
-    c2 = _build_c2_section(c2_results)
+    c2 = _build_c2_section(c2_results, executive_data)
+    yara = _build_yara_section(binary_results)
     attack = _build_attack_section(executive_data)
     iocs = _build_ioc_section(binary_results, c2_results, injection_report)
 
@@ -1083,14 +1347,16 @@ def generate(
             <div class="meta">Generated: {_esc(timestamp)}</div>
             {dump_line}
         </div>
+{executive}
 {dashboard}
 {binaries}
 {injection}
 {c2}
+{yara}
 {attack}
 {iocs}
         <div class="report-footer">
-            Generated by memdump-toolkit &middot; {_esc(timestamp)}
+            memdump-toolkit &middot; Vision Security Labs &middot; {_esc(timestamp)}
         </div>
     </div>
     <script>
@@ -1099,7 +1365,502 @@ def generate(
 </body>
 </html>"""
 
-    path = os.path.join(out_dir, "report.html")
+    path = os.path.join(out_dir, report_name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(page)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Inspect Report Generator
+# ---------------------------------------------------------------------------
+
+def _build_inspect_go_section(go: dict) -> str:
+    """Render Go analysis fields for the inspect report."""
+    parts: list[str] = []
+
+    # Module metadata table
+    meta_rows = ""
+    for field, label in (("module_path", "Module"), ("go_version", "Go Version"), ("binary_type", "Type")):
+        val = go.get(field)
+        if val:
+            meta_rows += f"<tr><td>{_esc(label)}</td><td class='mono'>{_esc(val)}</td></tr>"
+    if meta_rows:
+        parts.append(f"<table class='detail-table'>{meta_rows}</table>")
+
+    # Known tools
+    known_tools = go.get("known_tools", [])
+    if known_tools:
+        parts.append(f"<p><strong>Known Tools:</strong> {_esc(', '.join(known_tools))}</p>")
+
+    # Capabilities
+    caps = go.get("capabilities", [])
+    if isinstance(caps, dict) and caps:
+        cap_items = "".join(f"<li>{_esc(k)}</li>" for k in caps)
+        parts.append(f"<h3>Capabilities</h3><ul class='inspect-list'>{cap_items}</ul>")
+    elif isinstance(caps, list) and caps:
+        cap_items = "".join(f"<li>{_esc(c)}</li>" for c in caps)
+        parts.append(f"<h3>Capabilities</h3><ul class='inspect-list'>{cap_items}</ul>")
+
+    # Dependencies
+    deps = go.get("dependencies", [])
+    if deps:
+        li = "".join(f"<li class='mono'>{_esc(d)}</li>" for d in deps)
+        parts.append(f"<h3>Dependencies ({len(deps)})</h3><ul class='inspect-list'>{li}</ul>")
+
+    # Source files
+    src = go.get("source_files", [])
+    if src:
+        li = "".join(f"<li class='mono'>{_esc(s)}</li>" for s in src)
+        parts.append(f"<h3>Source Files ({len(src)})</h3><ul class='inspect-list'>{li}</ul>")
+
+    # Functions by package (table: package + count)
+    by_pkg = go.get("functions_by_package", {})
+    if by_pkg:
+        pkg_rows = "".join(
+            f"<tr><td class='mono'>{_esc(pkg)}</td><td>{_esc(len(fns))}</td></tr>"
+            for pkg, fns in sorted(by_pkg.items())
+        )
+        parts.append(
+            f"<h3>Functions by Package</h3>"
+            f"<div class='table-wrap'><table class='data-table'>"
+            f"<thead><tr><th>Package</th><th>Functions</th></tr></thead>"
+            f"<tbody>{pkg_rows}</tbody></table></div>"
+        )
+
+    # Network IOCs
+    net_iocs = go.get("network_iocs", {})
+    for key in ("urls", "named_pipes"):
+        items = net_iocs.get(key, [])
+        if items:
+            li = "".join(f"<li class='mono'>{_esc(i)}</li>" for i in items)
+            parts.append(f"<h3>Network IOCs — {_esc(key)}</h3><ul class='inspect-list'>{li}</ul>")
+
+    if not parts:
+        return ""
+    return (
+        "<section class='inspect-section'>"
+        "<h2>Go Analysis</h2>"
+        + "".join(parts)
+        + "</section>"
+    )
+
+
+def _build_inspect_dotnet_section(dn: dict) -> str:
+    """Render .NET analysis fields for the inspect report."""
+    parts: list[str] = []
+
+    # Metadata table
+    meta = dn.get("metadata", {})
+    if meta:
+        meta_rows = "".join(
+            f"<tr><td>{_esc(k)}</td><td class='mono'>{_esc(v)}</td></tr>"
+            for k, v in meta.items() if v
+        )
+        if meta_rows:
+            parts.append(
+                f"<div class='table-wrap'><table class='data-table'>"
+                f"<thead><tr><th>Field</th><th>Value</th></tr></thead>"
+                f"<tbody>{meta_rows}</tbody></table></div>"
+            )
+
+    # Obfuscators
+    obfs = dn.get("obfuscators", [])
+    if obfs:
+        rows = "".join(
+            f"<tr><td>{_esc(o.get('obfuscator', ''))}</td>"
+            f"<td class='mono dim'>{_esc(o.get('signature', ''))}</td></tr>"
+            for o in obfs
+        )
+        parts.append(
+            f"<h3>Obfuscators</h3>"
+            f"<div class='table-wrap'><table class='data-table'>"
+            f"<thead><tr><th>Obfuscator</th><th>Signature</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></div>"
+        )
+
+    # Suspicious P/Invoke by category
+    pinvoke_susp = dn.get("suspicious_pinvoke", {})
+    if pinvoke_susp:
+        rows = ""
+        for category, funcs in pinvoke_susp.items():
+            for fn in funcs:
+                rows += f"<tr><td>{_esc(category)}</td><td class='mono'>{_esc(fn)}</td></tr>"
+        if rows:
+            parts.append(
+                f"<h3>Suspicious P/Invoke</h3>"
+                f"<div class='table-wrap'><table class='data-table'>"
+                f"<thead><tr><th>Category</th><th>Function</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table></div>"
+            )
+
+    # All P/Invoke imports
+    pinvoke_all = dn.get("pinvoke_imports", [])
+    if pinvoke_all:
+        li = "".join(f"<li class='mono'>{_esc(fn)}</li>" for fn in pinvoke_all)
+        parts.append(f"<h3>P/Invoke Imports ({len(pinvoke_all)})</h3><ul class='inspect-list'>{li}</ul>")
+
+    # Referenced assemblies
+    refs = dn.get("referenced_assemblies", [])
+    if refs:
+        li = "".join(f"<li class='mono'>{_esc(r)}</li>" for r in refs)
+        parts.append(f"<h3>Referenced Assemblies ({len(refs)})</h3><ul class='inspect-list'>{li}</ul>")
+
+    if not parts:
+        return ""
+    return (
+        "<section class='inspect-section'>"
+        "<h2>.NET Analysis</h2>"
+        + "".join(parts)
+        + "</section>"
+    )
+
+
+def _build_inspect_config_section(config: dict) -> str:
+    """Render extracted config fields for the inspect report."""
+    parts: list[str] = []
+
+    def _cfg_list(label: str, items: list) -> str:
+        if not items:
+            return ""
+        li = "".join(
+            f"<li class='mono'>{_esc(i.get('ip', i) if isinstance(i, dict) else i)}</li>"
+            for i in items
+        )
+        return f"<h3>{_esc(label)}</h3><ul class='inspect-list'>{li}</ul>"
+
+    net = config.get("network", {})
+    for key in ("urls", "ips", "hostnames", "ip_ports", "named_pipes", "unc_paths", "ports"):
+        block = _cfg_list(key, net.get(key, []))
+        if block:
+            parts.append(block)
+
+    c2cfg = config.get("c2", {})
+    for key in ("http_headers", "user_agents", "timing_strings", "embedded_json"):
+        block = _cfg_list(key, c2cfg.get(key, []))
+        if block:
+            parts.append(block)
+
+    crypto = config.get("crypto", {})
+    for key in ("possible_hex_keys", "fingerprints", "pem_certificates", "base64_blobs"):
+        block = _cfg_list(key, crypto.get(key, []))
+        if block:
+            parts.append(block)
+
+    fb_types = config.get("flatbuffers", {}).get("flatbuffers_types", [])
+    if fb_types:
+        parts.append(_cfg_list("flatbuffers_types", fb_types))
+
+    if not parts:
+        return ""
+    return (
+        "<section class='inspect-section'>"
+        "<h2>Extracted Config</h2>"
+        + "".join(parts)
+        + "</section>"
+    )
+
+
+def _build_inspect_yara_section(yara_matches: list) -> str:
+    """Render YARA matches for the inspect report."""
+    if not yara_matches:
+        return (
+            "<section class='inspect-section'>"
+            "<h2>YARA Matches</h2>"
+            "<p class='dim'>No YARA matches (run with --yara to enable).</p>"
+            "</section>"
+        )
+
+    rows = ""
+    for m in yara_matches:
+        if isinstance(m, dict):
+            rule = _esc(m.get("rule", ""))
+            ruleset = _esc(m.get("ruleset", ""))
+            tags = _esc(", ".join(m.get("tags", [])))
+        else:
+            rule = _esc(str(m))
+            ruleset = ""
+            tags = ""
+        rows += f"<tr><td class='mono'>{rule}</td><td class='dim'>{ruleset}</td><td class='dim'>{tags}</td></tr>"
+
+    return (
+        f"<section class='inspect-section'>"
+        f"<h2>YARA Matches ({len(yara_matches)})</h2>"
+        f"<div class='table-wrap'><table class='data-table'>"
+        f"<thead><tr><th>Rule</th><th>Ruleset</th><th>Tags</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>"
+        f"</section>"
+    )
+
+
+# Inspect-specific CSS overrides (single-column layout, no sidebar)
+_INSPECT_CSS = """\
+/* Inspect layout overrides — no sidebar */
+body { display: block; }
+#main { margin-left: 0; padding: 32px 48px; max-width: 1100px; margin: 0 auto; }
+
+.inspect-header {
+    margin-bottom: 32px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+}
+.inspect-header h1 {
+    font-size: 26px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    word-break: break-all;
+    margin-bottom: 10px;
+}
+.inspect-header .lang-badge {
+    display: inline-block;
+    background: rgba(88,166,255,0.15);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    padding: 2px 10px;
+    margin-right: 12px;
+    text-transform: uppercase;
+    vertical-align: middle;
+}
+.inspect-header .meta-line {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-top: 6px;
+    font-family: var(--font-mono);
+}
+
+.inspect-risk {
+    margin-bottom: 28px;
+    padding: 20px 24px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+.inspect-risk h2 {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text-secondary);
+    margin-bottom: 10px;
+    border-bottom: none;
+    padding-bottom: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.inspect-risk .score-label {
+    font-size: 28px;
+    font-weight: 800;
+    font-family: var(--font-mono);
+    margin-bottom: 8px;
+}
+.score-bar-large {
+    height: 10px;
+    background: var(--bg-tertiary);
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 12px;
+    max-width: 600px;
+}
+.score-bar-large .score-fill {
+    height: 100%;
+    border-radius: 5px;
+}
+
+.inspect-warning {
+    background: rgba(255,68,68,0.08);
+    border: 1px solid rgba(255,68,68,0.4);
+    border-left: 4px solid var(--critical);
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin-bottom: 20px;
+}
+.inspect-warning h3 {
+    color: var(--critical);
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 8px;
+}
+.inspect-warning ul {
+    list-style: none;
+    padding: 0;
+}
+.inspect-warning li {
+    font-size: 13px;
+    padding: 3px 0;
+    color: var(--text-primary);
+}
+.inspect-warning li::before {
+    content: "\\26A0  ";
+    color: var(--critical);
+}
+
+.inspect-section {
+    margin-bottom: 36px;
+}
+.inspect-section h2 {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+}
+.inspect-section h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 14px 0 6px;
+}
+.inspect-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 8px;
+}
+.inspect-list li {
+    padding: 3px 0;
+    font-size: 13px;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+}
+.inspect-list li::before {
+    content: "\\2022  ";
+    color: var(--text-secondary);
+}
+
+.risk-factors-list {
+    list-style: none;
+    padding: 0;
+    margin: 6px 0 0;
+}
+.risk-factors-list li {
+    font-size: 13px;
+    padding: 4px 0;
+    color: var(--text-primary);
+}
+.risk-factors-list li::before {
+    content: "\\25B8  ";
+    color: var(--high);
+}
+"""
+
+
+def generate_inspect(out_dir: str, result: dict, report_name: str = "report.html") -> str:
+    """Generate a focused single-binary HTML report for `memdump-toolkit inspect`.
+
+    Args:
+        out_dir: Output directory (created if necessary).
+        result: Normalised inspect result dict (from _normalize_inspect_result).
+        report_name: Filename for the HTML file.
+
+    Returns:
+        Absolute path to the generated HTML file.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    filepath = result.get("file", "")
+    filename = Path(filepath).name if filepath else "unknown"
+    size = result.get("size", 0)
+    language = result.get("language") or "native"
+    hashes = result.get("hashes", {})
+    risk_score = result.get("risk_score", 0)
+    risk_factors = result.get("risk_factors", [])
+    offensive_tools = result.get("offensive_tools", [])
+    yara_matches = result.get("yara_matches", [])
+
+    # --- Header ---
+    size_str = f"{size:,} bytes" if size else "unknown size"
+    hash_lines = "".join(
+        f"<div>{_esc(algo.upper())}: {_esc(val)}</div>"
+        for algo, val in hashes.items() if val
+    )
+    header_html = f"""
+<div class="inspect-header">
+    <h1>{_esc(filename)}</h1>
+    <span class="lang-badge">{_esc(language)}</span>
+    <span class="meta-line">{_esc(size_str)}</span>
+    <div class="meta-line" style="margin-top:8px">{hash_lines}</div>
+</div>"""
+
+    # --- Risk score block ---
+    sev_label = _severity_label(risk_score)
+    sev_color = _severity_color(risk_score)
+    fill_width = min(risk_score, 100)
+    risk_html = f"""
+<div class="inspect-risk">
+    <h2>Risk Score</h2>
+    <div class="score-label" style="color:{sev_color}">{_esc(risk_score)} / 100 &nbsp; {_badge(sev_label)}</div>
+    <div class="score-bar-large">
+        <div class="score-fill" style="width:{fill_width}%;background:{sev_color}"></div>
+    </div>"""
+    if risk_factors:
+        factor_items = "".join(f"<li>{_esc(f)}</li>" for f in risk_factors)
+        risk_html += f"<ul class='risk-factors-list'>{factor_items}</ul>"
+    risk_html += "\n</div>"
+
+    # --- Offensive tools warning ---
+    warning_html = ""
+    if offensive_tools:
+        tool_items = "".join(
+            f"<li>{_esc(t.get('tool', ''))} &mdash; {_esc(t.get('signature', ''))}</li>"
+            for t in offensive_tools
+        )
+        warning_html = f"""
+<div class="inspect-warning">
+    <h3>Offensive Tools Detected ({len(offensive_tools)})</h3>
+    <ul>{tool_items}</ul>
+</div>"""
+
+    # --- Language-specific analysis ---
+    lang_html = ""
+    go = result.get("go_analysis", {})
+    dn = result.get("dotnet_analysis", {})
+    cfg = result.get("config", {})
+
+    if go:
+        lang_html = _build_inspect_go_section(go)
+    elif dn:
+        lang_html = _build_inspect_dotnet_section(dn)
+    if cfg:
+        lang_html += _build_inspect_config_section(cfg)
+
+    # --- YARA ---
+    yara_html = _build_inspect_yara_section(yara_matches)
+
+    # --- Footer ---
+    footer_html = f"""
+<div class="report-footer">
+    memdump-toolkit &middot; Vision Security Labs &middot; {_esc(timestamp)}
+</div>"""
+
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inspect: {_esc(filename)}</title>
+    <style>
+{_CSS}
+{_INSPECT_CSS}
+    </style>
+</head>
+<body>
+    <div id="main">
+{header_html}
+{risk_html}
+{warning_html}
+{lang_html}
+{yara_html}
+{footer_html}
+    </div>
+    <script>
+{_JS}
+    </script>
+</body>
+</html>"""
+
+    path = os.path.join(out_dir, report_name)
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)
     return path

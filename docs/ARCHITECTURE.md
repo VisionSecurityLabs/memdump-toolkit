@@ -322,11 +322,11 @@ Not every binary deserves the same level of scrutiny. The toolkit uses three tie
 
 4. **Language identification** — Determines what programming language was used to build the binary (see [Language Detection & Dispatch](#8-language-detection--dispatch) for details).
 
-5. **Import analysis** — Parses the import table with `pefile` and categorizes imported functions into threat categories: process injection, credential access, evasion, memory manipulation, code loading. The category definitions live in `constants.py` under `SUSPICIOUS_IMPORTS`.
+5. **Import analysis** — Parses the import table with `pefile` and categorizes imported functions into threat categories: process injection, credential access, evasion, memory manipulation, code loading. The category definitions live in `~/.memdump-toolkit/signatures.yml` (loaded by `signatures.py`, re-exported via `constants.py` for backward compatibility).
 
 6. **Section anomaly detection** — Flags sections with: RWX permissions (readable + writable + executable), WX permissions (writable + executable), non-standard names that do not start with a dot, and zero-size executable sections.
 
-7. **YARA-based tool attribution** — When `--yara-rules` is provided (explicit path or `auto` for `~/.memdump-toolkit/rules/`), scans the binary against all compiled YARA rules found recursively. Matches tagged with `offensive_tool` are promoted to tool attributions (e.g., Cobalt Strike, Metasploit). Language-specific tool signatures remain built-in: Go tools in `constants.py` under `KNOWN_TOOLS`, .NET tools in `DOTNET_OFFENSIVE_TOOLS`.
+7. **YARA-based tool attribution** — When `--yara-rules` is provided (explicit path or `auto` for `~/.memdump-toolkit/rules/`), scans the binary against all compiled YARA rules found recursively. Matches tagged with `offensive_tool` are promoted to tool attributions (e.g., Cobalt Strike, Metasploit). Language-specific tool signatures are also configurable: Go tools in `signatures.yml` under `KNOWN_TOOLS`, .NET tools under `DOTNET_OFFENSIVE_TOOLS` (loaded by `signatures.py`).
 
 8. **High entropy detection** — Calculates Shannon entropy for each section using the `shannon_entropy` function in `pe_utils.py`. Sections with entropy above 7.2 and size above 4 KB are flagged as potentially encrypted or packed content.
 
@@ -694,14 +694,23 @@ flowchart TD
     DOT --> PEU
     C2 --> PEU
 
+    PEU --> MIO["memory_io.py\n(page-by-page reads)"]
+    PEU --> SW["stack_walk.py\n(.pdata unwinding)"]
+    PEU --> YS["yara_scan.py\n(YARA caching)"]
+
     PEU --> CONST["constants.py"]
     AB --> CONST
     INJ --> CONST
     DOT --> CONST
 
+    CONST --> SIG["signatures.py\n(YAML config loader)"]
+    AB --> SIG
+    INJ --> SIG
+
     GO --> GOINFO["go_info.py"]
     CLI --> INSP["inspect_binary.py"]
     CLI --> FR["fetch_rules.py"]
+    FR --> SIG
     INSP --> GO
     INSP --> DOT
     INSP --> CFG
@@ -714,13 +723,14 @@ flowchart TD
 
 ### Key observations
 
-- **`pe_utils.py` is the shared foundation.** Every module that touches PE data imports from it: hashing, entropy, PE header parsing, import extraction, YARA scanning, memory reading, and CSV writing. All PE parsing goes through `pefile`.
-- **`constants.py` holds all detection signatures.** Packer signatures, suspicious import categories, language markers, system DLL names, trusted path fragments, shellcode patterns — all centralized so they can be updated without touching detection logic.
+- **`pe_utils.py` is the re-export facade for focused sub-modules.** It imports and re-exports from three specialized modules: `memory_io.py` (page-by-page memory reads), `stack_walk.py` (.pdata parsing + 3-phase stack unwinding), and `yara_scan.py` (YARA compilation and caching). All PE parsing goes through `pefile`, and the re-exports ensure backward compatibility — code can still do `from pe_utils import function_x`.
+- **`constants.py` loads all detection signatures from user-editable YAML.** All signature data (packer artifacts, suspicious import categories, language markers, system DLL names, shellcode patterns, etc.) now comes from `signatures.yml` loaded by `signatures.py`. The loader implements a first-run config pattern: bundled defaults are copied to `~/.memdump-toolkit/signatures.yml` on first run, users can extend without code changes, and `constants.py` re-exports for backward compatibility.
+- **`signatures.py` implements the first-run config pattern.** Bundled `signatures.default.yml` is copied to `~/.memdump-toolkit/signatures.yml` on first run. Users can customize detection signatures without modifying code, and `constants.py` imports from this loader.
 - **`full_analysis.py` is the orchestrator.** It does not contain detection logic — it calls each module's `analyze()` function in sequence and generates the triage summary.
 - **`executive_summary.py` is output-only.** It reads results from other steps and generates human-readable summaries and ATT&CK mappings. It has no detection logic.
 - **`inspect_binary.py` is a standalone single-binary inspector.** It provides the `inspect` CLI command — auto-detects language, dispatches to the appropriate analyzer (Go, .NET, or config extraction), runs YARA, and prints a unified colored report. Unlike `analyze_binary.py` (which operates within the full pipeline on extracted DLLs), `inspect_binary.py` works on any binary file directly.
 - **`colors.py` provides TTY-aware colored output.** Backed by the `rich` library, it exports formatting functions (`critical`, `high`, `info`, `dim`, `bold`, `severity`, `banner`) and a shared `Console` instance. Respects `NO_COLOR` and `FORCE_COLOR` environment variables. The `Tee` class in `full_analysis.py` strips ANSI codes when writing to the report file.
-- **`fetch_rules.py` manages YARA ruleset lifecycle.** Handles cloning/updating 6 public YARA ruleset repositories (signature-base, yara-rules, GCTI, reversinglabs, ESET, Elastic) into `~/.memdump-toolkit/rules/`. The `resolve_yara_dir()` function translates `--yara-rules auto` into the concrete rules path. The `inspect` and `full` commands consume these rules.
+- **`fetch_rules.py` manages YARA ruleset lifecycle with user-editable config.** Handles cloning/updating 6 public YARA ruleset repositories (signature-base, yara-rules, GCTI, reversinglabs, ESET, Elastic) into `~/.memdump-toolkit/rules/`. Uses the first-run config pattern: bundled `rulesets.default.yml` is copied to `~/.memdump-toolkit/rulesets.yml` on first run. Users can add custom repositories or remove defaults by editing `rulesets.yml`. The `resolve_yara_dir()` function translates `--yara-rules auto` into the concrete rules path. The `inspect` and `full` commands consume these rules.
 
 ---
 

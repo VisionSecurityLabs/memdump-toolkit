@@ -42,14 +42,12 @@ from memdump_toolkit.pe_utils import (
 
 # Worker state — initialized once per process via ProcessPoolExecutor initializer
 _worker_yara_dir: str | None = None
-_worker_known_good: set[str] | None = None
 
 
-def _init_worker(yara_dir: str | None, known_good: set[str] | None) -> None:
+def _init_worker(yara_dir: str | None) -> None:
     """Initialize worker process state (called once per worker by ProcessPoolExecutor)."""
-    global _worker_yara_dir, _worker_known_good
+    global _worker_yara_dir
     _worker_yara_dir = yara_dir
-    _worker_known_good = known_good
 
 
 def _analyze_file_worker(args: tuple[str, str]) -> dict[str, Any] | None:
@@ -74,7 +72,6 @@ def _analyze_file_worker(args: tuple[str, str]) -> dict[str, Any] | None:
     result = analyze_single_binary(
         filepath, data, source=source,
         yara_rules_dir=_worker_yara_dir,
-        known_good=_worker_known_good,
     )
 
     if not result.get("is_pe", False):
@@ -277,7 +274,6 @@ def _get_analysis_tier(filepath: str, source: str) -> int:
 def analyze_single_binary(
     filepath: str, data: bytes, source: str = "unknown",
     yara_rules_dir: str | None = None,
-    known_good: set[str] | None = None,
 ) -> dict[str, Any]:
     """Run universal analysis on a single PE binary.
 
@@ -338,7 +334,7 @@ def analyze_single_binary(
 
     if tier == 1:
         # Lightweight: stop here for trusted modules
-        result["risk_score"], result["risk_factors"] = compute_risk_score(result, known_good)
+        result["risk_score"], result["risk_factors"] = compute_risk_score(result)
         return result
 
     # ─── Tier 2: Full analysis ───────────────────────────────────────
@@ -433,17 +429,14 @@ def analyze_single_binary(
                 result["offensive_tools"] = offensive_tools
 
     # ─── Composite risk score ────────────────────────────────────────
-    result["risk_score"], result["risk_factors"] = compute_risk_score(result, known_good)
+    result["risk_score"], result["risk_factors"] = compute_risk_score(result)
 
     return result
 
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
-def compute_risk_score(
-    result: dict,
-    known_good: set[str] | None = None,
-) -> tuple[int, list[str]]:
+def compute_risk_score(result: dict) -> tuple[int, list[str]]:
     """Compute composite risk score (0-100) with human-readable factors."""
     score = 0
     factors: list[str] = []
@@ -548,13 +541,6 @@ def compute_risk_score(
     if net.get("urls") or net.get("named_pipes"):
         score += 10
         factors.append("embedded_network_iocs")
-
-    # Known-good hash match — strong de-prioritization
-    sha = result.get("hashes", {}).get("sha256", "")
-    if sha and known_good and sha.lower() in known_good:
-        score = max(score - 50, 0)
-        factors.append("KNOWN_GOOD_HASH")
-        result["known_good"] = True
 
     return min(score, 100), factors
 
@@ -675,7 +661,6 @@ def _print_report(results: list[dict]) -> None:
 def analyze(
     mf: Any, reader: Any, out_dir: str,
     yara_rules_dir: str | None = None,
-    known_good: set[str] | None = None,
 ) -> list[dict]:
     """Orchestrator entry point — analyze all extracted binaries from a dump.
 
@@ -720,7 +705,7 @@ def analyze(
             with ProcessPoolExecutor(
                 max_workers=max_workers,
                 initializer=_init_worker,
-                initargs=(yara_rules_dir, known_good),
+                initargs=(yara_rules_dir,),
             ) as pool:
                 for result in pool.map(_analyze_file_worker, file_tasks):
                     if result is not None:
@@ -732,7 +717,7 @@ def analyze(
 
     if not used_parallel:
         # Set worker state in main process for sequential mode
-        _init_worker(yara_rules_dir, known_good)
+        _init_worker(yara_rules_dir)
         for filepath, source in file_tasks:
             result = _analyze_file_worker((filepath, source))
             if result is not None:
@@ -809,7 +794,6 @@ def analyze(
 def run(
     dump_path: str, out_dir: str | None = None,
     verbose: bool = False, yara_rules_dir: str | None = None,
-    known_good: set[str] | None = None,
 ) -> list[dict]:
     """Standalone entry point — extracts DLLs first, then analyzes all."""
     setup_logging(verbose)
@@ -829,4 +813,4 @@ def run(
 
     # Step 2: Universal analysis
     print("\nRunning universal binary analysis...")
-    return analyze(mf, reader, out_dir, yara_rules_dir, known_good)
+    return analyze(mf, reader, out_dir, yara_rules_dir)

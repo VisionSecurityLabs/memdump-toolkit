@@ -118,64 +118,6 @@ def detect_pe_bitness(data: bytes) -> int:
         return 64
 
 
-# ─── Memory I/O ─────────────────────────────────────────────────────────────
-
-def read_pe_data(reader: Any, base: int, size: int) -> bytes:
-    """Read PE image page-by-page from minidump reader."""
-    data = bytearray(size)
-    for off in range(0, size, PAGE_SIZE):
-        try:
-            chunk = reader.read(base + off, min(PAGE_SIZE, size - off))
-            data[off:off + len(chunk)] = chunk
-        except Exception:
-            logger.debug("Failed to read page at 0x%x", base + off)
-    return bytes(data)
-
-
-def read_module_memory(reader: Any, base: int, size: int) -> tuple[bytes, int]:
-    """Full-read first, page-by-page fallback. Returns (data, bytes_read)."""
-    try:
-        return reader.read(base, size), size
-    except Exception:
-        logger.debug("Full read failed at 0x%x, falling back to page-by-page", base)
-
-    result = bytearray(size)
-    bytes_read = 0
-    for offset in range(0, size, PAGE_SIZE):
-        chunk_size = min(PAGE_SIZE, size - offset)
-        try:
-            data = reader.read(base + offset, chunk_size)
-            result[offset:offset + len(data)] = data
-            bytes_read += len(data)
-        except Exception:
-            logger.debug("Page read failed at 0x%x+0x%x", base, offset)
-    return bytes(result), bytes_read
-
-
-def read_pe_full_image(reader: Any, base: int, img_size: int, seg_size: int) -> bytes:
-    """Read a hidden PE image, handling segment boundary extension."""
-    read_size = min(img_size, seg_size)
-
-    try:
-        data = reader.read(base, read_size)
-    except Exception:
-        logger.debug("Full image read failed at 0x%x, falling back to page-by-page", base)
-        data = bytes(read_pe_data(reader, base, read_size))
-
-    if read_size < img_size:
-        full_data = bytearray(img_size)
-        full_data[:len(data)] = data
-        for off in range(read_size, img_size, PAGE_SIZE):
-            try:
-                chunk = reader.read(base + off, min(PAGE_SIZE, img_size - off))
-                full_data[off:off + len(chunk)] = chunk
-            except Exception:
-                logger.debug("Extension page read failed at 0x%x+0x%x", base, off)
-        data = bytes(full_data)
-
-    return data
-
-
 # ─── PE Section Parsing ─────────────────────────────────────────────────────
 
 def parse_pe_sections(data: bytes, pe_off: int = 0) -> list[SectionInfo]:
@@ -473,129 +415,182 @@ def check_pe_header(
     return pe_off, img_size, hdr
 
 
-# ─── YARA Integration ────────────────────────────────────────────────────────
+def find_headerless_pe(data: bytes, base_addr: int = 0) -> list[dict[str, Any]]:
+    """Find PE artifacts in memory where the MZ header has been zeroed out.
 
-def scan_with_yara(data: bytes, rules_dir: str | None = None) -> list[dict[str, Any]]:
-    """Scan binary data with YARA rules from a directory.
+    Searches for section table patterns (characteristics, section names)
+    and validates by finding the IMAGE_FILE_HEADER.Machine field nearby.
 
-    Returns list of matches: [{"rule": name, "tags": [...], "strings": [...]}]
-    Silently returns [] if yara-python is not installed or no rules found.
+    Returns list of candidate PEs:
+        [{"offset": int, "machine": int, "num_sections": int, "image_size_est": int}]
     """
-    if rules_dir is None:
-        return []
+    from memdump_toolkit.constants import (
+        PE_VALID_MACHINES, PE_SECTION_CODE_EXEC_READ, PE_KNOWN_SECTION_NAMES,
+        PE_SECTION_HEADER_SIZE, PE_MIN_SECTIONS_HEADERLESS, PE_MAX_SECTIONS_HEADERLESS,
+    )
+    import struct
 
-    try:
-        import yara
-    except ImportError:
-        logger.debug("yara-python not installed, skipping YARA scan")
-        return []
+    results: list[dict[str, Any]] = []
+    if len(data) < 0x200:
+        return results
 
-    import os
+    # Strategy: scan for section characteristic patterns at 40-byte intervals.
+    # In a PE section table, the Characteristics field is at offset +36 within
+    # each 40-byte section header. If we find CODE|EXECUTE|READ (0x60000020)
+    # at some offset, the next section's characteristics would be at offset+40.
 
-    # Validate and resolve rules directory
-    rules_dir = os.path.realpath(rules_dir)
-    if not os.path.isdir(rules_dir):
-        return []
+    # Scan for the characteristic pattern
+    target_chars = struct.pack("<I", PE_SECTION_CODE_EXEC_READ)
+    scan_limit = min(len(data), 0x2000)  # Section table is always in first ~8 KB
 
-    matches_out: list[dict[str, Any]] = []
+    pos = 0
+    while pos < scan_limit - 4:
+        idx = data.find(target_chars, pos, scan_limit)
+        if idx == -1:
+            break
+        pos = idx + 1
 
-    rule_files = {}
-    for root, _dirs, files in os.walk(rules_dir):
-        for fname in files:
-            if fname.endswith((".yar", ".yara")):
-                rule_files[os.path.join(root, fname)] = os.path.join(root, fname)
-
-    if not rule_files:
-        return []
-
-    # Many community rulesets (signature-base, etc.) use external variables.
-    # Provide sensible defaults so rules compile without errors.
-    externals = {
-        "filepath": "",
-        "filename": "",
-        "filetype": "",
-        "extension": "",
-        "owner": "",
-    }
-
-    # Compile rules individually so one broken file doesn't kill the scan.
-    # Track (compiled_rule, source_path) to attribute matches to rulesets.
-    compiled_rules: list[tuple[Any, str]] = []
-    skipped = 0
-    for fpath in rule_files.values():
-        try:
-            compiled_rules.append(
-                (yara.compile(filepath=fpath, externals=externals), fpath)
-            )
-        except yara.SyntaxError as e:
-            logger.debug("YARA skip %s: %s", fpath, e)
-            skipped += 1
-        except yara.Error as e:
-            logger.debug("YARA skip %s: %s", fpath, e)
-            skipped += 1
-
-    if skipped:
-        logger.info("YARA: compiled %d rules, skipped %d broken files",
-                     len(compiled_rules), skipped)
-    else:
-        logger.debug("YARA: compiled all %d rule files", len(compiled_rules))
-
-    import warnings
-
-    def _extract_source(fpath: str, base: str) -> str:
-        """Extract ruleset name and rule file from the full path.
-
-        For ~/.memdump-toolkit/rules/signature-base/yara/foo.yar
-        returns 'signature-base/yara/foo.yar'.
-        For other paths, returns the filename.
-        """
-        rel = os.path.relpath(fpath, base)
-        # rel will be e.g. "signature-base/yara/foo.yar" or just "foo.yar"
-        return rel
-
-    for rules, source_path in compiled_rules:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                matches = rules.match(data=data)
-        except Exception as e:
-            logger.debug("YARA match error: %s", e)
+        # Characteristics is at offset +36 within a 40-byte section header.
+        # So the start of this section header is at idx - 36.
+        sec_start = idx - 36
+        if sec_start < 0:
             continue
 
-        source = _extract_source(source_path, rules_dir)
-        # Ruleset name is the first path component (e.g. "signature-base")
-        ruleset = source.split(os.sep)[0] if os.sep in source else ""
+        # Validate: the first 8 bytes of the section header should be the name.
+        # Check if it looks like a known section name.
+        sec_name = data[sec_start:sec_start + 8]
+        name_match = sec_name in PE_KNOWN_SECTION_NAMES
+        # Also accept names that are printable ASCII (custom section names)
+        name_printable = all(
+            (0x20 <= b <= 0x7E or b == 0) for b in sec_name
+        ) and sec_name[0] != 0
 
-        for m in matches:
-            # Handle both yara-python v3 (tuple) and v4 (object) string APIs
-            str_entries: list[dict] = []
-            if hasattr(m, "strings"):
-                for s in m.strings[:10]:
-                    if hasattr(s, "identifier"):
-                        # v4+: StringMatch objects with .instances
-                        for inst in (s.instances[:3] if hasattr(s, "instances") else []):
-                            str_entries.append({
-                                "offset": inst.offset,
-                                "identifier": s.identifier,
-                                "data": bytes(inst.matched_data[:100]).hex(),
-                            })
-                    else:
-                        # v3: plain tuples (offset, identifier, data)
-                        str_entries.append({
-                            "offset": s[0], "identifier": s[1],
-                            "data": s[2][:100].hex(),
-                        })
+        if not (name_match or name_printable):
+            continue
 
-            matches_out.append({
-                "rule": m.rule,
-                "tags": list(m.tags),
-                "meta": dict(m.meta) if hasattr(m, "meta") else {},
-                "strings": str_entries,
-                "source": source,
-                "ruleset": ruleset,
+        # Walk forward and backward to find all consecutive section headers
+        sections_found: list[dict] = []
+
+        # Walk backward from sec_start to find earlier sections
+        check = sec_start
+        while check >= 0:
+            s_name = data[check:check + 8]
+            s_printable = all(
+                (0x20 <= b <= 0x7E or b == 0) for b in s_name
+            ) and len(s_name) == 8 and s_name[0] != 0
+
+            if not (s_name in PE_KNOWN_SECTION_NAMES or s_printable):
+                break
+
+            if check + 40 <= len(data):
+                vsize = struct.unpack_from("<I", data, check + 8)[0]
+                va = struct.unpack_from("<I", data, check + 12)[0]
+                rsize = struct.unpack_from("<I", data, check + 16)[0]
+                chars = struct.unpack_from("<I", data, check + 36)[0]
+                sections_found.insert(0, {
+                    "name": s_name.rstrip(b"\x00").decode("ascii", errors="replace"),
+                    "virtual_size": vsize,
+                    "virtual_address": va,
+                    "raw_size": rsize,
+                    "characteristics": chars,
+                })
+            check -= PE_SECTION_HEADER_SIZE
+
+        # Walk forward from the section after sec_start
+        check = sec_start + PE_SECTION_HEADER_SIZE
+        while check + PE_SECTION_HEADER_SIZE <= len(data) and check < scan_limit:
+            s_name = data[check:check + 8]
+            s_printable = all(
+                (0x20 <= b <= 0x7E or b == 0) for b in s_name
+            ) and len(s_name) == 8 and s_name[0] != 0
+
+            if not (s_name in PE_KNOWN_SECTION_NAMES or s_printable):
+                break
+
+            vsize = struct.unpack_from("<I", data, check + 8)[0]
+            va = struct.unpack_from("<I", data, check + 12)[0]
+            rsize = struct.unpack_from("<I", data, check + 16)[0]
+            chars = struct.unpack_from("<I", data, check + 36)[0]
+            sections_found.append({
+                "name": s_name.rstrip(b"\x00").decode("ascii", errors="replace"),
+                "virtual_size": vsize,
+                "virtual_address": va,
+                "raw_size": rsize,
+                "characteristics": chars,
             })
+            check += PE_SECTION_HEADER_SIZE
 
-    return matches_out
+        # Validate: need at least PE_MIN_SECTIONS_HEADERLESS sections
+        if len(sections_found) < PE_MIN_SECTIONS_HEADERLESS:
+            continue
+        if len(sections_found) > PE_MAX_SECTIONS_HEADERLESS:
+            continue
+
+        # Validate: virtual addresses should be ascending
+        vas = [s["virtual_address"] for s in sections_found]
+        if vas != sorted(vas) or len(set(vas)) != len(vas):
+            continue
+
+        # Validate: all virtual addresses should be positive and reasonable
+        if any(va == 0 or va > 0x80000000 for va in vas):
+            continue
+
+        # Find the offset of the first section header in the table.
+        # sec_start is the header that matched CODE|EXEC|READ; find its
+        # index within sections_found so we can compute the table start.
+        trigger_va = struct.unpack_from("<I", data, sec_start + 12)[0]
+        trigger_idx = next(
+            (i for i, s in enumerate(sections_found)
+             if s["virtual_address"] == trigger_va),
+            0,
+        )
+        first_sec_offset = sec_start - trigger_idx * PE_SECTION_HEADER_SIZE
+
+        # Search for Machine field in the ~300 bytes before the section table
+        machine = 0
+        search_start = max(0, first_sec_offset - 300)
+        for moff in range(search_start, first_sec_offset):
+            if moff + 2 > len(data):
+                break
+            candidate = struct.unpack_from("<H", data, moff)[0]
+            if candidate in PE_VALID_MACHINES:
+                # Sanity: NumberOfSections should be at moff + 2
+                if moff + 4 <= len(data):
+                    num_sec = struct.unpack_from("<H", data, moff + 2)[0]
+                    if num_sec == len(sections_found):
+                        machine = candidate
+                        break
+
+        if machine == 0:
+            # Couldn't confirm Machine field — still report but lower confidence
+            pass
+
+        # Estimate image size from last section
+        last = sections_found[-1]
+        image_size_est = last["virtual_address"] + max(last["virtual_size"], last["raw_size"])
+
+        # Compute the actual PE start offset within the data buffer.
+        # The PE header (or where it would be) precedes the section table.
+        pe_data_offset = max(first_sec_offset - 300, 0)  # conservative estimate
+
+        # Avoid duplicates: skip if we already found a PE at a nearby offset
+        actual_addr = base_addr + pe_data_offset
+        if any(abs(r["offset"] - actual_addr) < 0x1000 for r in results):
+            continue
+
+        results.append({
+            "offset": actual_addr,
+            "machine": machine,
+            "num_sections": len(sections_found),
+            "sections": sections_found,
+            "image_size_est": image_size_est,
+            "machine_confirmed": machine != 0,
+        })
+
+        # Skip past this table to avoid re-detecting
+        pos = sec_start + len(sections_found) * PE_SECTION_HEADER_SIZE
+
+    return results
 
 
 # ─── Shared Helpers ────────────────────────────────────────────────────────
@@ -659,3 +654,9 @@ def write_csv(path: str, rows: list[dict], fieldnames: Any) -> None:
         for row in rows:
             sanitized = {k: _sanitize_csv_value(str(v)) for k, v in row.items()}
             writer.writerow(sanitized)
+
+
+# ─── Re-exports (backward compatibility) ────────────────────────────────────
+from memdump_toolkit.memory_io import read_pe_data, read_module_memory, read_pe_full_image  # noqa: E402, F401
+from memdump_toolkit.stack_walk import parse_pdata, unwind_frame, walk_stack_frames  # noqa: E402, F401
+from memdump_toolkit.yara_scan import scan_with_yara  # noqa: E402, F401

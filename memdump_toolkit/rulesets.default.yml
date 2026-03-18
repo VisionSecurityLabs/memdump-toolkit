@@ -1,0 +1,41 @@
+# memdump-toolkit YARA rulesets configuration
+#
+# Add custom rulesets below, same format as the defaults.
+# Each entry requires: repo (git URL), subdir (path within repo), description.
+#
+# Example:
+#   my-rules:
+#     repo: https://github.com/yourorg/yara-rules.git
+#     subdir: rules
+#     description: Internal detection rules
+#
+
+signature-base:
+  repo: https://github.com/Neo23x0/signature-base.git
+  subdir: yara
+  description: Cobalt Strike, Go implants, webshells (Neo23x0)
+
+yara-rules:
+  repo: https://github.com/Yara-Rules/rules.git
+  subdir: .
+  description: Broad malware families, packers, exploits
+
+gcti:
+  repo: https://github.com/chronicle/GCTI.git
+  subdir: YARA
+  description: APT-focused, high quality (Google)
+
+reversinglabs:
+  repo: https://github.com/reversinglabs/reversinglabs-yara-rules.git
+  subdir: yara
+  description: Large malware family signature set
+
+eset:
+  repo: https://github.com/eset/malware-ioc.git
+  subdir: .
+  description: ESET research publications
+
+elastic:
+  repo: https://github.com/elastic/protections-artifacts.git
+  subdir: yara/rules
+  description: Elastic threat research

@@ -74,7 +74,334 @@ def compare_modules(reader: Any, base1: int, base2: int, size: int) -> dict:
     }
 
 
-# ─── New Checks ──────────────────────────────────────────────────────────────
+# ─── Inline Check Helpers (CHECKs 1–5) ───────────────────────────────────────
+
+
+def _check_typosquatting(
+    modules: list, reader: Any, name_map: dict, is_32bit: bool,
+) -> list[dict]:
+    """CHECK 1: Typosquatting detection via Levenshtein distance and homoglyph analysis."""
+    findings: list[dict] = []
+    for mod in modules:
+        mod_name = Path(mod.name).name.lower()
+        for legit in SYSTEM_DLLS:
+            if mod_name == legit:
+                continue
+            if abs(len(mod_name) - len(legit)) > 2:
+                continue
+            dist = levenshtein(mod_name, legit)
+            homoglyph = is_homoglyph(mod_name, legit)
+            if not (0 < dist <= 2 or homoglyph):
+                continue
+
+            detection = "HOMOGLYPH" if homoglyph else f"EDIT_DIST_{dist}"
+            finding: dict = {
+                "type": "TYPOSQUATTING", "severity": "HIGH",
+                "module": mod.name, "base": f"0x{mod.baseaddress:016x}",
+                "size": mod.size, "similar_to": legit,
+                "edit_distance": dist, "detection_method": detection,
+                "heap_address": is_heap_address(mod.baseaddress, is_32bit),
+            }
+            if legit in name_map:
+                real = name_map[legit][0]
+                finding["legitimate_base"] = f"0x{real.baseaddress:016x}"
+                if mod.size == real.size:
+                    finding["comparison"] = compare_modules(
+                        reader, mod.baseaddress, real.baseaddress, mod.size,
+                    )
+            findings.append(finding)
+    return findings
+
+
+def _check_heap_loaded(
+    modules: list, is_32bit: bool, flagged_bases: set,
+) -> list[dict]:
+    """CHECK 2: Modules loaded at heap-region addresses."""
+    findings: list[dict] = []
+    for mod in modules:
+        if is_heap_address(mod.baseaddress, is_32bit):
+            base_str = f"0x{mod.baseaddress:016x}"
+            if base_str not in flagged_bases:
+                findings.append({
+                    "type": "HEAP_LOADED_MODULE", "severity": "MEDIUM",
+                    "module": mod.name, "base": base_str, "size": mod.size,
+                })
+    return findings
+
+
+def _check_duplicate_modules(name_map: dict) -> list[dict]:
+    """CHECK 3: Multiple modules with the same filename."""
+    findings: list[dict] = []
+    for name, mods in name_map.items():
+        if len(mods) > 1:
+            findings.append({
+                "type": "DUPLICATE_MODULE", "severity": "HIGH",
+                "module_name": name,
+                "instances": [
+                    {"base": f"0x{m.baseaddress:016x}", "path": m.name}
+                    for m in mods
+                ],
+            })
+    return findings
+
+
+# ─── CHECK 4 sub-helpers ─────────────────────────────────────────────────────
+
+
+def _resolve_pe_identity(
+    reader: Any, base: int, seg_size: int, pe_info: dict,
+) -> str:
+    """Resolve PE identity, falling back to a larger read if header was small."""
+    identity = get_pe_identity(pe_info)
+    if not identity or identity == "UNKNOWN":
+        try:
+            more = reader.read(base, min(seg_size, 0x10000))
+            identity = get_pe_identity(get_pe_info(more))
+        except Exception:
+            logger.debug("Failed to extract PE identity for hidden module")
+            identity = "UNKNOWN"
+    return identity
+
+
+def _classify_boundary_pe(
+    base: int, ep: int, img_size: int, identity: str,
+    is_go: bool, is_32bit: bool,
+) -> tuple[str, list[str]]:
+    """Assign severity and flags for a boundary-scan hidden PE."""
+    severity = "LOW"
+    flags: list[str] = []
+    if identity == "UNKNOWN":
+        severity = "HIGH"
+        flags.append("NO_IDENTITY")
+    if is_heap_address(base, is_32bit):
+        flags.append("HEAP_REGION")
+    if ep == 0x200:
+        severity = "HIGH"
+        flags.append("SUSPICIOUS_EP_0x200")
+    if is_go:
+        severity = "CRITICAL"
+        flags.append("GO_BINARY")
+    if img_size > LARGE_PE_THRESHOLD and identity == "UNKNOWN":
+        severity = "CRITICAL"
+        flags.append("LARGE_UNKNOWN")
+    return severity, flags
+
+
+def _scan_segment_boundaries(
+    reader: Any, known_bases: set, is_32bit: bool,
+) -> tuple[list[dict], set, int, int]:
+    """Scan segment start addresses for MZ headers.
+
+    Returns (findings, found_bases, hidden_count, hidden_unknown).
+    """
+    findings: list[dict] = []
+    found_bases: set = set(known_bases)
+    hidden_count = hidden_unknown = 0
+
+    for seg in reader.memory_segments:
+        base = seg.start_virtual_address
+        seg_size = seg.end_virtual_address - base
+        hdr_result = check_pe_header(reader, base, seg_size)
+        if not hdr_result or base in known_bases:
+            continue
+
+        pe_off, img_size, hdr = hdr_result
+        hidden_count += 1
+        pe_info = get_pe_info(hdr)
+        identity = _resolve_pe_identity(reader, base, seg_size, pe_info)
+        is_dll = pe_info.get("is_dll", False)
+        ep = pe_info.get("entry_point", 0)
+
+        is_go = False
+        try:
+            page = reader.read(base, min(seg_size, PAGE_SIZE))
+            if b"Go build" in page or b".symtab" in page or b"go.buildid" in page:
+                is_go = True
+        except Exception:
+            logger.debug("Failed to read page for Go marker check at 0x%x", base)
+
+        severity, flags = _classify_boundary_pe(
+            base, ep, img_size, identity, is_go, is_32bit,
+        )
+        if identity == "UNKNOWN":
+            hidden_unknown += 1
+
+        found_bases.add(base)
+        findings.append({
+            "type": "HIDDEN_PE", "severity": severity,
+            "base": f"0x{base:016x}", "image_size": img_size,
+            "captured_in_segment": seg_size, "is_dll": is_dll,
+            "entry_point": f"0x{ep:x}",
+            "timestamp": pe_info.get("timestamp", ""),
+            "identity": identity, "is_go": is_go, "flags": flags,
+        })
+
+    return findings, found_bases, hidden_count, hidden_unknown
+
+
+def _deep_scan_segments(
+    reader: Any, found_bases: set, is_32bit: bool,
+) -> tuple[list[dict], int, int]:
+    """Deep scan for MZ headers at page-aligned offsets within segments."""
+    findings: list[dict] = []
+    deep_count = hidden_unknown = 0
+    for seg in reader.memory_segments:
+        seg_base = seg.start_virtual_address
+        seg_size = seg.end_virtual_address - seg_base
+        if seg_size <= PAGE_SIZE * 2 or seg_size > MAX_SEGMENT_SCAN_SIZE:
+            continue
+        chunk_size = 2_000_000
+        for chunk_offset in range(0, seg_size, chunk_size):
+            read_size = min(chunk_size, seg_size - chunk_offset)
+            try:
+                chunk_data = reader.read(seg_base + chunk_offset, read_size)
+            except Exception:
+                break
+            scan_start = PAGE_SIZE if chunk_offset == 0 else 0
+            for off in range(scan_start, len(chunk_data) - 0x200, PAGE_SIZE):
+                if chunk_data[off:off + 2] != b"MZ":
+                    continue
+                candidate_base = seg_base + chunk_offset + off
+                if candidate_base in found_bases:
+                    continue
+                hdr_result = check_pe_header(
+                    reader, candidate_base, seg_size - (chunk_offset + off),
+                )
+                if not hdr_result:
+                    continue
+                pe_off, img_size, hdr = hdr_result
+                pe_info = get_pe_info(hdr)
+                identity = get_pe_identity(pe_info)
+
+                found_bases.add(candidate_base)
+                deep_count += 1
+                is_dll = pe_info.get("is_dll", False)
+                ep = pe_info.get("entry_point", 0)
+
+                severity = "HIGH"
+                flags_deep: list[str] = ["DEEP_SCAN", "MID_SEGMENT"]
+                if identity == "UNKNOWN":
+                    hidden_unknown += 1
+                    flags_deep.append("NO_IDENTITY")
+                if img_size > LARGE_PE_THRESHOLD and identity == "UNKNOWN":
+                    severity = "CRITICAL"
+                    flags_deep.append("LARGE_UNKNOWN")
+
+                findings.append({
+                    "type": "HIDDEN_PE", "severity": severity,
+                    "base": f"0x{candidate_base:016x}", "image_size": img_size,
+                    "captured_in_segment": seg_size, "is_dll": is_dll,
+                    "entry_point": f"0x{ep:x}",
+                    "timestamp": pe_info.get("timestamp", ""),
+                    "identity": identity, "flags": flags_deep,
+                })
+
+    return findings, deep_count, hidden_unknown
+
+
+def _recover_headerless_pes(
+    reader: Any, found_bases: set,
+) -> tuple[list[dict], int]:
+    """Find PEs with zeroed MZ headers via section table pattern matching.
+
+    Returns (findings, headerless_count).
+    """
+    from memdump_toolkit.pe_utils import find_headerless_pe
+
+    findings: list[dict] = []
+    headerless_count = 0
+
+    for seg in reader.memory_segments:
+        base = seg.start_virtual_address
+        seg_size = seg.end_virtual_address - base
+        if seg_size < 0x200 or base in found_bases:
+            continue
+        try:
+            hdr_data = reader.read(base, min(seg_size, 0x2000))
+        except Exception:
+            continue
+        if hdr_data[:2] == b"MZ":
+            continue
+        candidates = find_headerless_pe(hdr_data, base)
+        for cand in candidates:
+            found_bases.add(base)
+            headerless_count += 1
+
+            machine_str = (
+                "x64" if cand.get("machine") == 0x8664
+                else "x86" if cand.get("machine") == 0x014C
+                else "?"
+            )
+            sec_names = [s["name"] for s in cand.get("sections", [])]
+
+            severity = "CRITICAL"
+            flags_hl: list[str] = ["HEADERLESS_PE", "MZ_ZEROED"]
+            if not cand.get("machine_confirmed"):
+                flags_hl.append("MACHINE_UNCONFIRMED")
+                severity = "HIGH"
+
+            findings.append({
+                "type": "HIDDEN_PE", "severity": severity,
+                "base": f"0x{base:016x}",
+                "image_size": cand.get("image_size_est", 0),
+                "captured_in_segment": seg_size,
+                "is_dll": False,
+                "entry_point": "",
+                "timestamp": "",
+                "identity": "HEADERLESS_PE",
+                "flags": flags_hl,
+                "machine": machine_str,
+                "num_sections": cand["num_sections"],
+                "section_names": sec_names,
+            })
+
+    return findings, headerless_count
+
+
+def _check_hidden_pes(
+    reader: Any, mf: Any, known_bases: set, is_32bit: bool,
+) -> tuple[list[dict], int, int]:
+    """CHECK 4: Hidden PE images not in module list.
+
+    Includes segment-boundary scan, deep intra-segment scan, and headerless PE
+    recovery.  Returns (findings, hidden_count, hidden_unknown).
+    """
+    # Phase 1: segment boundary scan
+    boundary_findings, found_bases, hidden_count, hidden_unknown = (
+        _scan_segment_boundaries(reader, known_bases, is_32bit)
+    )
+    all_findings = list(boundary_findings)
+
+    # Phase 2: deep intra-segment scan
+    deep_findings, deep_count, deep_unknown = _deep_scan_segments(
+        reader, found_bases, is_32bit,
+    )
+    all_findings.extend(deep_findings)
+    hidden_count += deep_count
+    hidden_unknown += deep_unknown
+
+    # Phase 3: headerless PE recovery
+    hl_findings, headerless_count = _recover_headerless_pes(reader, found_bases)
+    all_findings.extend(hl_findings)
+    hidden_count += headerless_count
+
+    return all_findings, hidden_count, hidden_unknown
+
+
+def _check_untrusted_paths(modules: list) -> list[dict]:
+    """CHECK 5: Modules loaded from non-system paths."""
+    findings: list[dict] = []
+    for mod in modules:
+        if not is_trusted_path(mod.name):
+            findings.append({
+                "type": "UNTRUSTED_PATH", "severity": "INFO",
+                "module": mod.name, "base": f"0x{mod.baseaddress:016x}",
+            })
+    return findings
+
+
+# ─── Existing Check Helpers (CHECKs 6–9) ─────────────────────────────────────
+
 
 def check_threads(mf: Any, modules: list) -> list[dict]:
     """CHECK 6: Threads executing outside any known module."""
@@ -391,6 +718,111 @@ def check_suspicious_imports(reader: Any, modules: list, is_32bit: bool) -> list
     return findings
 
 
+def check_thread_stacks(
+    mf: Any, modules: list, reader: Any, is_32bit: bool,
+) -> list[dict]:
+    """CHECK 9: Walk thread stacks to find return addresses outside known modules.
+
+    Catches threads that were called FROM shellcode but are currently executing
+    inside a legitimate module (e.g., in kernel32.Sleep after being called from
+    injected code).
+    """
+    from memdump_toolkit.constants import STACK_CRITICAL_THRESHOLD
+    from memdump_toolkit.pe_utils import walk_stack_frames
+
+    findings: list[dict] = []
+    if not hasattr(mf, "threads") or not mf.threads:
+        return findings
+
+    module_ranges = _build_module_ranges(modules)
+
+    # Build executable memory ranges (for stack scan false positive filtering)
+    exec_ranges: list[tuple[int, int]] = []
+    if hasattr(mf, "memory_info") and mf.memory_info:
+        EXECUTABLE_PROTECTS = (
+            PAGE_EXECUTE, PAGE_EXECUTE_READ,
+            PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        )
+        try:
+            entries = getattr(mf.memory_info, "infos", None) or mf.memory_info.entries
+            for info in entries:
+                if (getattr(info, "State", 0) == 0x1000
+                        and getattr(info, "Protect", 0) in EXECUTABLE_PROTECTS):
+                    exec_ranges.append((info.BaseAddress, info.BaseAddress + info.RegionSize))
+        except AttributeError:
+            pass
+
+    # Build .pdata unwind tables for precise x64 stack walking
+    pdata_tables: list[list[tuple[int, int, int]]] = []
+    if not is_32bit:
+        from memdump_toolkit.pe_utils import parse_pdata
+        for mod in modules:
+            try:
+                base = mod.baseaddress
+                size = mod.size
+                # Read module from memory to parse .pdata
+                data = reader.read(base, min(size, 0x100000))  # Cap at 1MB for .pdata parsing
+                table = parse_pdata(data, base)
+                if table:
+                    pdata_tables.append(table)
+            except Exception:
+                continue
+
+    try:
+        threads = mf.threads.threads
+    except AttributeError:
+        return findings
+
+    for thread in threads:
+        try:
+            ctx = thread.ThreadContext
+            if ctx is None:
+                continue
+
+            if is_32bit:
+                rsp = getattr(ctx, "Esp", 0) or 0
+                rbp = getattr(ctx, "Ebp", 0) or 0
+            else:
+                rsp = getattr(ctx, "Rsp", 0) or 0
+                rbp = getattr(ctx, "Rbp", 0) or 0
+
+            if rsp <= 0x10000:
+                continue
+
+            frames = walk_stack_frames(
+                reader, rsp, rbp, module_ranges,
+                is_32bit=is_32bit, exec_ranges=exec_ranges,
+                pdata_tables=pdata_tables,
+            )
+
+            # Find return addresses outside any known module
+            outside = [f for f in frames if not f["in_module"]]
+            if not outside:
+                continue
+
+            sev = "CRITICAL" if len(outside) >= STACK_CRITICAL_THRESHOLD else "HIGH"
+            findings.append({
+                "type": "STACK_RETURN_OUTSIDE_MODULE",
+                "severity": sev,
+                "thread_id": thread.ThreadId,
+                "suspicious_returns": len(outside),
+                "total_frames": len(frames),
+                "details": [
+                    {
+                        "address": f"0x{f['address']:016x}",
+                        "source": f["source"],
+                        "frame_depth": f.get("frame_depth", f.get("stack_offset", -1)),
+                    }
+                    for f in outside[:10]  # Cap details at 10 entries
+                ],
+            })
+        except Exception:
+            logger.debug("Failed to walk stack for TID %s",
+                         getattr(thread, "ThreadId", "?"))
+
+    return findings
+
+
 # ─── Core Analysis ───────────────────────────────────────────────────────────
 
 def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
@@ -420,41 +852,16 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     logger.info("[1] TYPOSQUATTING DETECTION (Levenshtein + homoglyph)")
     logger.info("%s", "=" * 80)
 
-    for mod in modules:
-        mod_name = Path(mod.name).name.lower()
-        for legit in SYSTEM_DLLS:
-            if mod_name == legit:
-                continue
-            # Length pre-filter: skip if names differ by > 2 chars
-            if abs(len(mod_name) - len(legit)) > 2:
-                continue
-            dist = levenshtein(mod_name, legit)
-            homoglyph = is_homoglyph(mod_name, legit)
-            if not (0 < dist <= 2 or homoglyph):
-                continue
-
-            detection = "HOMOGLYPH" if homoglyph else f"EDIT_DIST_{dist}"
-            finding: dict = {
-                "type": "TYPOSQUATTING", "severity": "HIGH",
-                "module": mod.name, "base": f"0x{mod.baseaddress:016x}",
-                "size": mod.size, "similar_to": legit,
-                "edit_distance": dist, "detection_method": detection,
-                "heap_address": is_heap_address(mod.baseaddress, is_32bit),
-            }
-            if legit in name_map:
-                real = name_map[legit][0]
-                finding["legitimate_base"] = f"0x{real.baseaddress:016x}"
-                if mod.size == real.size:
-                    logger.info("\n  Comparing '%s' vs '%s'...", Path(mod.name).name, legit)
-                    finding["comparison"] = compare_modules(
-                        reader, mod.baseaddress, real.baseaddress, mod.size,
-                    )
-            report["findings"].append(finding)
-            logger.info("\n  ⚠ TYPOSQUAT [%s]: %s -> mimics %s", detection, Path(mod.name).name, legit)
-            logger.info("    Base: %s  (heap: %s)", finding['base'], finding['heap_address'])
-            if "comparison" in finding:
-                c = finding["comparison"]
-                logger.info("    Similarity: %s%%  (%s/%s pages)", c['similarity_pct'], c['identical_pages'], c['total_pages'])
+    typo_findings = _check_typosquatting(modules, reader, name_map, is_32bit)
+    report["findings"].extend(typo_findings)
+    for f in typo_findings:
+        if "comparison" in f:
+            logger.info("\n  Comparing '%s' vs '%s'...", Path(f['module']).name, f['similar_to'])
+        logger.info("\n  ⚠ TYPOSQUAT [%s]: %s -> mimics %s", f['detection_method'], Path(f['module']).name, f['similar_to'])
+        logger.info("    Base: %s  (heap: %s)", f['base'], f['heap_address'])
+        if "comparison" in f:
+            c = f["comparison"]
+            logger.info("    Similarity: %s%%  (%s/%s pages)", c['similarity_pct'], c['identical_pages'], c['total_pages'])
 
     # CHECK 2: Heap-loaded modules
     logger.info("\n%s", "=" * 80)
@@ -462,31 +869,22 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     logger.info("%s", "=" * 80)
 
     flagged_bases = {f["base"] for f in report["findings"]}
-    for mod in modules:
-        if is_heap_address(mod.baseaddress, is_32bit):
-            base_str = f"0x{mod.baseaddress:016x}"
-            if base_str not in flagged_bases:
-                report["findings"].append({
-                    "type": "HEAP_LOADED_MODULE", "severity": "MEDIUM",
-                    "module": mod.name, "base": base_str, "size": mod.size,
-                })
-                logger.info("  ⚠ %-50s  Base: %s  Size: %s", Path(mod.name).name, base_str, f"{mod.size:,}")
+    heap_findings = _check_heap_loaded(modules, is_32bit, flagged_bases)
+    report["findings"].extend(heap_findings)
+    for f in heap_findings:
+        logger.info("  ⚠ %-50s  Base: %s  Size: %s", Path(f['module']).name, f['base'], f"{f['size']:,}")
 
     # CHECK 3: Duplicate modules
     logger.info("\n%s", "=" * 80)
     logger.info("[3] DUPLICATE MODULE NAMES")
     logger.info("%s", "=" * 80)
 
-    for name, mods in name_map.items():
-        if len(mods) > 1:
-            report["findings"].append({
-                "type": "DUPLICATE_MODULE", "severity": "HIGH",
-                "module_name": name,
-                "instances": [{"base": f"0x{m.baseaddress:016x}", "path": m.name} for m in mods],
-            })
-            logger.info("\n  ⚠ '%s' loaded %d times:", name, len(mods))
-            for m in mods:
-                logger.info("    0x%016x  %s", m.baseaddress, m.name)
+    dup_findings = _check_duplicate_modules(name_map)
+    report["findings"].extend(dup_findings)
+    for f in dup_findings:
+        logger.info("\n  ⚠ '%s' loaded %d times:", f['module_name'], len(f['instances']))
+        for inst in f['instances']:
+            logger.info("    %s  %s", inst['base'], inst['path'])
 
     # CHECK 4: Hidden PE images
     logger.info("\n%s", "=" * 80)
@@ -494,140 +892,27 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     logger.info("%s", "=" * 80)
 
     known_bases = get_known_bases(mf)
-    hidden_count = hidden_unknown = 0
-
-    for seg in reader.memory_segments:
-        base = seg.start_virtual_address
-        seg_size = seg.end_virtual_address - base
-        hdr_result = check_pe_header(reader, base, seg_size)
-        if not hdr_result or base in known_bases:
-            continue
-
-        pe_off, img_size, hdr = hdr_result
-        hidden_count += 1
-
-        # Use get_pe_info on the header for identity (no full read needed here)
-        pe_info = get_pe_info(hdr)
-        identity = get_pe_identity(pe_info)
-
-        # If header was too small for version info, try reading more
-        if not identity or identity == "UNKNOWN":
-            try:
-                more = reader.read(base, min(seg_size, 0x10000))
-                more_info = get_pe_info(more)
-                identity = get_pe_identity(more_info)
-            except Exception:
-                logger.debug("Failed to extract PE identity for hidden module")
-                identity = "UNKNOWN"
-
-        is_dll = pe_info.get("is_dll", False)
-        ep = pe_info.get("entry_point", 0)
-
-        is_go = False
-        try:
-            page = reader.read(base, min(seg_size, PAGE_SIZE))
-            if b"Go build" in page or b".symtab" in page or b"go.buildid" in page:
-                is_go = True
-        except Exception:
-            logger.debug("Failed to read page for Go marker check at 0x%x", base)
-
-        severity = "LOW"
-        flags: list[str] = []
-        if identity == "UNKNOWN":
-            hidden_unknown += 1
-            severity = "HIGH"
-            flags.append("NO_IDENTITY")
-        if is_heap_address(base, is_32bit):
-            flags.append("HEAP_REGION")
-        if ep == 0x200:  # Common shellcode/packed PE entry point
-            severity = "HIGH"
-            flags.append("SUSPICIOUS_EP_0x200")
-        if is_go:
-            severity = "CRITICAL"
-            flags.append("GO_BINARY")
-        if img_size > LARGE_PE_THRESHOLD and identity == "UNKNOWN":
-            severity = "CRITICAL"
-            flags.append("LARGE_UNKNOWN")
-
-        report["findings"].append({
-            "type": "HIDDEN_PE", "severity": severity,
-            "base": f"0x{base:016x}", "image_size": img_size,
-            "captured_in_segment": seg_size, "is_dll": is_dll,
-            "entry_point": f"0x{ep:x}",
-            "timestamp": pe_info.get("timestamp", ""),
-            "identity": identity, "is_go": is_go, "flags": flags,
-        })
-
-        if severity in ("HIGH", "CRITICAL"):
-            marker = "!!!" if severity == "CRITICAL" else " ! "
-            logger.info("  [%s] 0x%016x  %s  ImgSize=0x%x  EP=0x%x  %s", marker, base, "DLL" if is_dll else "EXE", img_size, ep, identity)
-            if flags:
-                logger.info("        Flags: %s", ", ".join(flags))
-
-    # Deep scan: search for MZ headers at page-aligned offsets WITHIN segments.
-    # Catches manually mapped PEs that don't start at a segment boundary.
-    found_bases = known_bases | {
-        int(f["base"], 16) for f in report["findings"] if f.get("type") == "HIDDEN_PE"
-    }
-    deep_count = 0
-    for seg in reader.memory_segments:
-        seg_base = seg.start_virtual_address
-        seg_size = seg.end_virtual_address - seg_base
-        # Only scan segments > 1 page that aren't tiny
-        if seg_size <= PAGE_SIZE * 2 or seg_size > MAX_SEGMENT_SCAN_SIZE:
-            continue
-        # Scan segment in 2 MB chunks to cover the full segment
-        chunk_size = 2_000_000
-        for chunk_offset in range(0, seg_size, chunk_size):
-            read_size = min(chunk_size, seg_size - chunk_offset)
-            try:
-                chunk_data = reader.read(seg_base + chunk_offset, read_size)
-            except Exception:
-                break
-            # Scan at every page boundary; skip offset 0 of the first chunk
-            # (already checked in the segment-boundary scan above)
-            scan_start = PAGE_SIZE if chunk_offset == 0 else 0
-            for off in range(scan_start, len(chunk_data) - 0x200, PAGE_SIZE):
-                if chunk_data[off:off + 2] != b"MZ":
-                    continue
-                candidate_base = seg_base + chunk_offset + off
-                if candidate_base in found_bases:
-                    continue
-                # Validate PE header
-                hdr_result = check_pe_header(reader, candidate_base, seg_size - (chunk_offset + off))
-                if not hdr_result:
-                    continue
-                pe_off, img_size, hdr = hdr_result
-                pe_info = get_pe_info(hdr)
-                identity = get_pe_identity(pe_info)
-
-                found_bases.add(candidate_base)
-                hidden_count += 1
-                deep_count += 1
-                is_dll = pe_info.get("is_dll", False)
-                ep = pe_info.get("entry_point", 0)
-
-                severity = "HIGH"
-                flags_deep: list[str] = ["DEEP_SCAN", "MID_SEGMENT"]
-                if identity == "UNKNOWN":
-                    hidden_unknown += 1
-                    flags_deep.append("NO_IDENTITY")
-                if img_size > LARGE_PE_THRESHOLD and identity == "UNKNOWN":
-                    severity = "CRITICAL"
-                    flags_deep.append("LARGE_UNKNOWN")
-
-                report["findings"].append({
-                    "type": "HIDDEN_PE", "severity": severity,
-                    "base": f"0x{candidate_base:016x}", "image_size": img_size,
-                    "captured_in_segment": seg_size, "is_dll": is_dll,
-                    "entry_point": f"0x{ep:x}",
-                    "timestamp": pe_info.get("timestamp", ""),
-                    "identity": identity, "flags": flags_deep,
-                })
-                logger.info("  [ ! ] 0x%016x  %s  ImgSize=0x%x  EP=0x%x  %s  [DEEP_SCAN]", candidate_base, "DLL" if is_dll else "EXE", img_size, ep, identity)
-
-    if deep_count:
-        logger.info("  Deep scan found %d additional PE(s) inside segments", deep_count)
+    hidden_findings, hidden_count, hidden_unknown = _check_hidden_pes(
+        reader, mf, known_bases, is_32bit,
+    )
+    report["findings"].extend(hidden_findings)
+    for f in hidden_findings:
+        flags_list = f.get("flags", [])
+        if f.get("identity") == "HEADERLESS_PE":
+            logger.info("  [!!!] %s  HEADERLESS  %s  %d sections: %s  [MZ_ZEROED]",
+                        f['base'], f.get('machine', '?'), f.get('num_sections', 0),
+                        ", ".join(f.get('section_names', [])))
+        elif "DEEP_SCAN" in flags_list:
+            logger.info("  [ ! ] %s  %s  ImgSize=0x%x  EP=%s  %s  [DEEP_SCAN]",
+                        f['base'], "DLL" if f['is_dll'] else "EXE",
+                        f['image_size'], f['entry_point'], f['identity'])
+        elif f["severity"] in ("HIGH", "CRITICAL"):
+            marker = "!!!" if f["severity"] == "CRITICAL" else " ! "
+            logger.info("  [%s] %s  %s  ImgSize=0x%x  EP=%s  %s",
+                        marker, f['base'], "DLL" if f['is_dll'] else "EXE",
+                        f['image_size'], f['entry_point'], f['identity'])
+            if flags_list:
+                logger.info("        Flags: %s", ", ".join(flags_list))
 
     logger.info("\n  Total hidden: %d  (Unknown: %d)", hidden_count, hidden_unknown)
 
@@ -636,13 +921,10 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     logger.info("[5] UNTRUSTED MODULE PATHS")
     logger.info("%s", "=" * 80)
 
-    for mod in modules:
-        if not is_trusted_path(mod.name):
-            report["findings"].append({
-                "type": "UNTRUSTED_PATH", "severity": "INFO",
-                "module": mod.name, "base": f"0x{mod.baseaddress:016x}",
-            })
-            logger.info("  %-50s  %s", Path(mod.name).name, mod.name)
+    path_findings = _check_untrusted_paths(modules)
+    report["findings"].extend(path_findings)
+    for f in path_findings:
+        logger.info("  %-50s  %s", Path(f['module']).name, f['module'])
 
     # CHECK 6: Thread injection
     logger.info("\n%s", "=" * 80)
@@ -650,8 +932,8 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     logger.info("%s", "=" * 80)
 
     thread_findings = check_threads(mf, modules)
+    report["findings"].extend(thread_findings)
     for f in thread_findings:
-        report["findings"].append(f)
         logger.info("  ⚠ Thread %s at %s (outside all modules)", f['thread_id'], f['instruction_pointer'])
     if not thread_findings:
         logger.info("  No suspicious thread start addresses detected.")
@@ -662,8 +944,8 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     logger.info("%s", "=" * 80)
 
     exec_findings = check_executable_regions(mf, modules, reader=reader)
+    report["findings"].extend(exec_findings)
     for f in exec_findings:
-        report["findings"].append(f)
         sc = f.get("shellcode")
         ftype = f["type"]
         if sc and sc["verdict"] in ("shellcode", "suspicious"):
@@ -672,10 +954,8 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
             logger.info("  ⚠ %s at %s  Size: %s  [%s] %s", ftype, f['base'], f"{f['size']:,}", label, flags_str)
         elif ftype in ("RWX_REGION", "RWX_PRIVATE", "EXEC_PRIVATE"):
             logger.info("  ⚠ %s at %s  Size: %s  Protect: %s  Type: %s", ftype, f['base'], f"{f['size']:,}", f['protect'], f.get('mem_type', '?'))
-        else:
-            # Lower-severity exec regions — only print if HIGH+
-            if f.get("severity") in ("CRITICAL", "HIGH"):
-                logger.info("  ⚠ %s at %s  Size: %s  Protect: %s", ftype, f['base'], f"{f['size']:,}", f['protect'])
+        elif f.get("severity") in ("CRITICAL", "HIGH"):
+            logger.info("  ⚠ %s at %s  Size: %s  Protect: %s", ftype, f['base'], f"{f['size']:,}", f['protect'])
     if not exec_findings:
         logger.info("  No suspicious executable regions detected (or MemoryInfoList not in dump).")
 
@@ -685,12 +965,28 @@ def analyze(mf: Any, reader: Any, out_dir: str) -> dict[str, Any]:
     logger.info("%s", "=" * 80)
 
     import_findings = check_suspicious_imports(reader, modules, is_32bit)
+    report["findings"].extend(import_findings)
     for f in import_findings:
-        report["findings"].append(f)
         cats = ", ".join(f["suspicious_categories"].keys())
         logger.info("  ⚠ %-50s  Categories: %s", Path(f['module']).name, cats)
     if not import_findings:
         logger.info("  No suspicious import combinations detected in untrusted modules.")
+
+    # CHECK 9: Stack frame walking
+    logger.info("\n%s", "=" * 80)
+    logger.info("[9] THREAD STACK RETURN ADDRESS ANALYSIS")
+    logger.info("%s", "=" * 80)
+
+    stack_findings = check_thread_stacks(mf, modules, reader, is_32bit)
+    report["findings"].extend(stack_findings)
+    for f in stack_findings:
+        logger.info("  ⚠ Thread %s: %d/%d return addresses outside modules [%s]",
+                     f['thread_id'], f['suspicious_returns'], f['total_frames'],
+                     f['severity'])
+        for d in f.get("details", [])[:5]:
+            logger.info("      → %s (%s)", d['address'], d['source'])
+    if not stack_findings:
+        logger.info("  No suspicious stack return addresses detected.")
 
     # Summary
     logger.info("\n%s", "=" * 80)

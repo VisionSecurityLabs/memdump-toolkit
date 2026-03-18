@@ -23,6 +23,7 @@ If you are new to memory forensics, think of a minidump as a photograph of a run
 11. [Detection Techniques We Could Borrow](#11-detection-techniques-we-could-borrow)
 12. [Module Dependency Graph](#12-module-dependency-graph)
 13. [Data Flow](#13-data-flow)
+14. [Known Limitations](LIMITATIONS.md)
 
 ---
 
@@ -137,7 +138,7 @@ MITRE ATT&CK is a **standardized catalog of attacker behaviors**, maintained by 
 
 ### Why memory-dumped hashes don't match on-disk files
 
-When you extract a DLL from a memory dump and hash it, the SHA-256 will **never** match the hash of the same DLL sitting on disk. This means you cannot look up memory-dumped hashes on VirusTotal, NSRL, or any other hash database and expect a match. This is not a bug — it is an inherent property of how Windows loads PE files into memory.
+When you extract a DLL from a memory dump and hash it, the SHA-256 will **never** match the hash of the same DLL sitting on disk. This means you cannot look up memory-dumped hashes on VirusTotal or any other on-disk hash database and expect a match. This is not a bug — it is an inherent property of how Windows loads PE files into memory.
 
 Three things change between the on-disk file and the in-memory image:
 
@@ -147,7 +148,7 @@ Three things change between the on-disk file and the in-memory image:
 
 3. **Page zeroing and partial paging**. The OS only pages in memory as it is accessed. Sections that were never touched may be **zeroed out** in the dump, while the on-disk file has real content there. Conversely, some pages may have been modified by runtime patches (hotpatching, hooks) that further change the content.
 
-**Practical implication:** The toolkit computes and reports hashes for every extracted binary (they are useful for correlating across multiple dumps of the same process), but these hashes are **memory-image hashes**, not file hashes. To match against known-good databases like NSRL, use the `--known-good` option with a hash set built from memory images of trusted binaries, or rely on the toolkit's other signals (imports, strings, sections, YARA) for identification.
+**Practical implication:** The toolkit computes and reports hashes for every extracted binary (they are useful for correlating across multiple dumps of the same process), but these hashes are **memory-image hashes**, not file hashes. To filter known-good binaries, use the `--known-good` option with a hash set built from memory images of trusted binaries, or rely on the toolkit's other signals (imports, strings, sections, YARA) for identification.
 
 ---
 
@@ -261,6 +262,16 @@ In plain English: Step 1 pulled out the binaries. Step 2 asks "do any of these l
 | 7 | **RWX memory regions** | Memory regions that are readable + writable + executable, outside known modules | Reads the `MemoryInfoList` stream from the dump and filters for `PAGE_EXECUTE_READWRITE` regions. Then runs 7-heuristic shellcode analysis: function prologues, API hashing patterns, NOP sleds, code density, embedded PEs, statistical classification (pe-sieve approach), and capstone disassembly validation. | HIGH-CRITICAL |
 | 8 | **Suspicious imports** | Untrusted modules importing dangerous API combinations | Parses the import table of every untrusted module and categorizes the functions (process injection, credential access, evasion, etc.). The `process_injection` combo (`VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread`) is an automatic HIGH. | MEDIUM-HIGH |
 
+**Check 9 — Stack Frame Walking** (`check_thread_stacks`)
+
+Walks each thread's call stack to extract return addresses, then checks each against the module list. This catches threads that are currently executing inside a legitimate API (e.g., `kernel32.Sleep`) but were *called from* injected code — a scenario that CHECK 6 (instruction pointer only) misses.
+
+Uses a hybrid approach:
+1. **Frame pointer chain** (RBP/EBP): Follows the frame pointer chain to extract return addresses. Precise but breaks with `-fomit-frame-pointer` (common in optimized builds).
+2. **Stack scan fallback**: If the frame chain breaks within 3 frames, scans the stack as an array of pointer-sized values and checks each against executable memory regions. This reduces false positives from non-code pointers on the stack.
+
+Severity: HIGH for 1-2 suspicious return addresses, CRITICAL for 3+.
+
 ### Shellcode analysis (Check 7, in detail)
 
 When an RWX region is found, `analyze_shellcode()` runs seven heuristics on the content:
@@ -311,11 +322,11 @@ Not every binary deserves the same level of scrutiny. The toolkit uses three tie
 
 4. **Language identification** — Determines what programming language was used to build the binary (see [Language Detection & Dispatch](#8-language-detection--dispatch) for details).
 
-5. **Import analysis** — Parses the import table with `pefile` and categorizes imported functions into threat categories: process injection, credential access, evasion, memory manipulation, code loading. The category definitions live in `constants.py` under `SUSPICIOUS_IMPORTS`.
+5. **Import analysis** — Parses the import table with `pefile` and categorizes imported functions into threat categories: process injection, credential access, evasion, memory manipulation, code loading. The category definitions live in `~/.memdump-toolkit/signatures.yml` (loaded by `signatures.py`, re-exported via `constants.py` for backward compatibility).
 
 6. **Section anomaly detection** — Flags sections with: RWX permissions (readable + writable + executable), WX permissions (writable + executable), non-standard names that do not start with a dot, and zero-size executable sections.
 
-7. **YARA-based tool attribution** — When `--yara-rules` is provided (explicit path or `auto` for `~/.memdump-toolkit/rules/`), scans the binary against all compiled YARA rules found recursively. Matches tagged with `offensive_tool` are promoted to tool attributions (e.g., Cobalt Strike, Metasploit). Language-specific tool signatures remain built-in: Go tools in `constants.py` under `KNOWN_TOOLS`, .NET tools in `DOTNET_OFFENSIVE_TOOLS`.
+7. **YARA-based tool attribution** — When `--yara-rules` is provided (explicit path or `auto` for `~/.memdump-toolkit/rules/`), scans the binary against all compiled YARA rules found recursively. Matches tagged with `offensive_tool` are promoted to tool attributions (e.g., Cobalt Strike, Metasploit). Language-specific tool signatures are also configurable: Go tools in `signatures.yml` under `KNOWN_TOOLS`, .NET tools under `DOTNET_OFFENSIVE_TOOLS` (loaded by `signatures.py`).
 
 8. **High entropy detection** — Calculates Shannon entropy for each section using the `shannon_entropy` function in `pe_utils.py`. Sections with entropy above 7.2 and size above 4 KB are flagged as potentially encrypted or packed content.
 
@@ -546,6 +557,8 @@ Every binary gets a composite risk score from 0 to 100, built by adding points f
 | **Embedded network IOCs** | +10 | URLs or named pipes found in config extraction |
 | **Memory manipulation imports** | +5 | `VirtualAlloc` + `VirtualProtect` (without the process injection combo) |
 | **Timestamp anomaly** | +5 | Date before 2000 or in the future (but not epoch zero/max) |
+| **Headerless PE** | +25 | Binary found via section table patterns with zeroed MZ header |
+| **Section unpacking** | +15 | Executable section with virtual/raw size ratio >= 10x and entropy >= 6.5 |
 
 The score is capped at 100. Severity labels are derived from the score:
 
@@ -603,7 +616,9 @@ In plain English: pe-sieve is a patrol officer doing a quick but thorough walk-t
 
 These are concrete improvements we could implement, inspired by pe-sieve's detection capabilities.
 
-### 1. Headerless PE recovery
+### 1. Headerless PE recovery — IMPLEMENTED
+
+**Status:** Implemented in `pe_utils.find_headerless_pe()`. Scans for section table patterns (characteristics `0x60000020`, Machine field `0x014C`/`0x8664`, section name validation) when MZ headers are zeroed out. Integrated into `extract_dlls.py` (extracts headerless PEs as `headerless_*.bin`) and `detect_injection.py` CHECK 4 (flags as CRITICAL with `HEADERLESS_PE` / `MZ_ZEROED` flags). Validated by requiring 2+ sections with ascending virtual addresses and optional Machine field correlation.
 
 **The gap:** Our hidden PE scan (in `extract_dlls.py` and `detect_injection.py`) only finds PEs by looking for the `MZ` magic bytes at the start. If an attacker zeroes out the first two bytes of an injected DLL, we miss it entirely.
 
@@ -621,7 +636,9 @@ These are concrete improvements we could implement, inspired by pe-sieve's detec
 
 The implementation adds pe-sieve-inspired byte frequency analysis with three sub-detectors (CodeMatcher, ObfuscatedMatcher, EncryptedMatcher) that classify memory regions based on byte distribution. This closes the XOR-encoded shellcode blind spot (entropy 4.0-6.0). Additionally, heuristic #7 adds optional capstone-based disassembly validation to confirm whether a region contains real executable instructions.
 
-### 3. Thread call stack analysis
+### 3. Thread call stack analysis — IMPLEMENTED
+
+**Status:** Implemented as CHECK 9 in `detect_injection.check_thread_stacks()` using `pe_utils.walk_stack_frames()`. Uses a hybrid approach: frame pointer chain walk (RBP/EBP) first, with stack scan fallback for optimized binaries that omit frame pointers. Stack scan filters candidates against executable memory regions to reduce false positives. Escalates to CRITICAL when 3+ return addresses from the same thread fall outside known modules.
 
 **The gap:** In `detect_injection.py` Check 6, we only check each thread's instruction pointer (RIP on x64, EIP on x86). If a thread is currently executing inside `kernel32.dll` (legitimate) but was *called from* shellcode, we miss it.
 
@@ -629,13 +646,24 @@ The implementation adds pe-sieve-inspired byte frequency analysis with three sub
 
 **What we would need to implement:** Parse the stack memory from the dump and walk the frame chain (using RBP/RSP frame pointers or unwind data) to extract return addresses. Then check each return address against the module list. This would catch threads that called *into* shellcode and have since returned, or threads that are currently in a legitimate API call but were *invoked* from injected code.
 
-### 4. Section unpacking detection
+### 4. Section unpacking detection — IMPLEMENTED (heuristic)
+
+**Status:** Implemented as a heuristic in `analyze_binary.detect_section_anomalies()`. Since we lack on-disk originals for direct comparison, the implementation detects unpacking by checking if an executable section has `virtual_size / raw_size >= 10x` combined with entropy >= 6.5. This pattern — large in memory, tiny on disk, high entropy — strongly suggests runtime unpacking. Adds +15 to risk score. The full disk-vs-memory comparison described below remains a future enhancement for live-process analysis.
 
 **The gap:** We detect packed binaries by looking for packer signatures in section names (UPX, Themida, etc.) and high entropy. But if an attacker uses a custom packer with no known signature, we might miss it.
 
 **What pe-sieve does:** For listed modules, it compares the on-disk PE sections with the in-memory versions. A section that was all-zeros on disk but contains non-zero data in memory was filled at runtime — this is the hallmark of runtime unpacking.
 
 **What we could approximate:** Since we do not have the on-disk originals, we cannot do a direct comparison. However, we could heuristically detect unpacking by checking if a PE has sections with very low raw data size (on-disk size) but large virtual size (in-memory size) combined with high entropy in the memory content. This pattern — "small on disk, large and encrypted in memory" — strongly suggests the section was unpacked at runtime.
+
+### Implementation Status
+
+| Technique | Status | Location |
+|-----------|--------|----------|
+| Headerless PE recovery | **Implemented** | `pe_utils.find_headerless_pe()`, CHECK 4 |
+| Statistical shellcode classification | **Implemented** | `detect_injection.analyze_shellcode()` heuristic #6 |
+| Thread call stack analysis | **Implemented** | `detect_injection.check_thread_stacks()`, CHECK 9 |
+| Section unpacking detection | **Implemented (heuristic)** | `analyze_binary.detect_section_anomalies()` |
 
 ---
 
@@ -666,14 +694,23 @@ flowchart TD
     DOT --> PEU
     C2 --> PEU
 
+    PEU --> MIO["memory_io.py\n(page-by-page reads)"]
+    PEU --> SW["stack_walk.py\n(.pdata unwinding)"]
+    PEU --> YS["yara_scan.py\n(YARA caching)"]
+
     PEU --> CONST["constants.py"]
     AB --> CONST
     INJ --> CONST
     DOT --> CONST
 
+    CONST --> SIG["signatures.py\n(YAML config loader)"]
+    AB --> SIG
+    INJ --> SIG
+
     GO --> GOINFO["go_info.py"]
     CLI --> INSP["inspect_binary.py"]
     CLI --> FR["fetch_rules.py"]
+    FR --> SIG
     INSP --> GO
     INSP --> DOT
     INSP --> CFG
@@ -686,13 +723,14 @@ flowchart TD
 
 ### Key observations
 
-- **`pe_utils.py` is the shared foundation.** Every module that touches PE data imports from it: hashing, entropy, PE header parsing, import extraction, YARA scanning, memory reading, and CSV writing. All PE parsing goes through `pefile`.
-- **`constants.py` holds all detection signatures.** Packer signatures, suspicious import categories, language markers, system DLL names, trusted path fragments, shellcode patterns — all centralized so they can be updated without touching detection logic.
+- **`pe_utils.py` is the re-export facade for focused sub-modules.** It imports and re-exports from three specialized modules: `memory_io.py` (page-by-page memory reads), `stack_walk.py` (.pdata parsing + 3-phase stack unwinding), and `yara_scan.py` (YARA compilation and caching). All PE parsing goes through `pefile`, and the re-exports ensure backward compatibility — code can still do `from pe_utils import function_x`.
+- **`constants.py` loads all detection signatures from user-editable YAML.** All signature data (packer artifacts, suspicious import categories, language markers, system DLL names, shellcode patterns, etc.) now comes from `signatures.yml` loaded by `signatures.py`. The loader implements a first-run config pattern: bundled defaults are copied to `~/.memdump-toolkit/signatures.yml` on first run, users can extend without code changes, and `constants.py` re-exports for backward compatibility.
+- **`signatures.py` implements the first-run config pattern.** Bundled `signatures.default.yml` is copied to `~/.memdump-toolkit/signatures.yml` on first run. Users can customize detection signatures without modifying code, and `constants.py` imports from this loader.
 - **`full_analysis.py` is the orchestrator.** It does not contain detection logic — it calls each module's `analyze()` function in sequence and generates the triage summary.
 - **`executive_summary.py` is output-only.** It reads results from other steps and generates human-readable summaries and ATT&CK mappings. It has no detection logic.
 - **`inspect_binary.py` is a standalone single-binary inspector.** It provides the `inspect` CLI command — auto-detects language, dispatches to the appropriate analyzer (Go, .NET, or config extraction), runs YARA, and prints a unified colored report. Unlike `analyze_binary.py` (which operates within the full pipeline on extracted DLLs), `inspect_binary.py` works on any binary file directly.
 - **`colors.py` provides TTY-aware colored output.** Backed by the `rich` library, it exports formatting functions (`critical`, `high`, `info`, `dim`, `bold`, `severity`, `banner`) and a shared `Console` instance. Respects `NO_COLOR` and `FORCE_COLOR` environment variables. The `Tee` class in `full_analysis.py` strips ANSI codes when writing to the report file.
-- **`fetch_rules.py` manages YARA ruleset lifecycle.** Handles cloning/updating 6 public YARA ruleset repositories (signature-base, yara-rules, GCTI, reversinglabs, ESET, Elastic) into `~/.memdump-toolkit/rules/`. The `resolve_yara_dir()` function translates `--yara-rules auto` into the concrete rules path. The `inspect` and `full` commands consume these rules.
+- **`fetch_rules.py` manages YARA ruleset lifecycle with user-editable config.** Handles cloning/updating 6 public YARA ruleset repositories (signature-base, yara-rules, GCTI, reversinglabs, ESET, Elastic) into `~/.memdump-toolkit/rules/`. Uses the first-run config pattern: bundled `rulesets.default.yml` is copied to `~/.memdump-toolkit/rulesets.yml` on first run. Users can add custom repositories or remove defaults by editing `rulesets.yml`. The `resolve_yara_dir()` function translates `--yara-rules auto` into the concrete rules path. The `inspect` and `full` commands consume these rules.
 
 ---
 

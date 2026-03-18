@@ -8,20 +8,27 @@ Forensic analysis toolkit for Windows process memory dumps. Extracts every DLL, 
 # Install
 git clone <repo> && cd MemDump
 uv sync
-
-# All commands below assume the venv is active. Either:
-#   source .venv/bin/activate        (activate once per shell)
-#   uv run memdump-toolkit ...       (prefix each command)
-
-# Analyze a dump (one command does everything)
-memdump-toolkit full process_dump.dmp -o ./results
-
-# Check results
-cat results/triage_summary.json    # prioritized findings
-cat results/suspicious_binaries.csv # scored binaries
-cat results/iocs.csv                # SIEM-ready IOCs
-cat results/full_report.txt         # human-readable report
 ```
+
+**Step 1 — Run the full pipeline on the dump:**
+
+```bash
+uv run memdump-toolkit full dumps/process.dmp -o results/
+```
+
+This produces `results/report.html` — an interactive report with injection findings,
+binary risk scores, C2 indicators, MITRE ATT&CK mapping, and recommended actions.
+
+**Step 2 — Deep-dive the most suspicious binary with YARA:**
+
+Open `report.html`, find the highest-risk binary in the Executive Summary, then:
+
+```bash
+uv run memdump-toolkit inspect results/hidden/hidden_001_0x....dll --yara
+```
+
+This generates a focused per-binary report (`results/hidden/output/report_hidden_001_....html`)
+with full Go/dotnet/config analysis, capabilities, dependencies, and YARA matches.
 
 ## What It Does
 
@@ -29,7 +36,7 @@ The `full` command runs a 5-step pipeline on any Windows minidump:
 
 ```
 Step 1: Extract    → Recovers all DLLs (listed + hidden PEs from raw memory)
-Step 2: Injection  → Flags 8 injection tactics (typosquatting, RWX, heap modules, ...)
+Step 2: Injection  → Flags 9 injection tactics (typosquatting, RWX, stack walking, ...)
 Step 3: Analyze    → Scores EVERY binary for malicious indicators (language-agnostic)
 Step 4: C2 Hunt    → Scans ALL process memory for live C2 URLs, keys, certs, pipes
 Step 5: Report     → Triage summary + IOC export (cross-references all findings)
@@ -42,8 +49,8 @@ Step 5: Report     → Triage summary + IOC export (cross-references all finding
 | Language detection | Go, .NET, Rust, Delphi, Nim (auto-dispatches to deep analyzers) |
 | Packer artifacts | UPX, Themida, VMProtect, ASPack, MPRESS, Enigma, ... |
 | Suspicious imports | Process injection, credential access, memory manipulation APIs |
-| Section anomalies | RWX sections, unusual names, zero-size executable sections |
-| YARA rule matching | Cobalt Strike, Metasploit, custom signatures (via --yara-rules) |
+| Section anomalies | RWX sections, unusual names, zero-size executable, runtime unpacking |
+| YARA rule matching | Cobalt Strike, Metasploit, custom signatures (via --yara or --yara-rules) |
 | Timestamp anomalies | Epoch zero, future dates, pre-2000 |
 | Config extraction | Embedded IPs, URLs, named pipes, crypto keys, C2 parameters |
 
@@ -58,6 +65,8 @@ Binaries are scored 0-100 and categorized: **CRITICAL** (60+), **HIGH** (30+), *
 | Full | Hidden + untrusted binaries | All checks + language dispatch + config | Where threats live |
 
 On a 217-module SQL Server dump: 58 skipped, 142 lightweight, 17 full → **completes in ~25 seconds**.
+
+Step 3 (binary analysis) runs in parallel across up to 4 CPU cores. YARA rules compile once per worker process and are cached for all subsequent binaries. Falls back to sequential automatically on single-core systems.
 
 ## Installation
 
@@ -87,8 +96,9 @@ Requires [uv](https://docs.astral.sh/uv/). Python 3.10 is auto-installed. Core d
 
 ```bash
 memdump-toolkit full dump.dmp -o ./results
-memdump-toolkit full dump.dmp -o ./results --yara-rules auto     # auto-discover fetched rules
+memdump-toolkit full dump.dmp -o ./results --yara              # use community rules
 memdump-toolkit full dump.dmp -o ./results --yara-rules ./rules/ # explicit path
+memdump-toolkit full dump.dmp -o ./results --update-yara --yara  # update then scan
 memdump-toolkit full dump.dmp -o ./results -v                    # verbose/debug
 ```
 
@@ -124,6 +134,9 @@ memdump-toolkit c2-hunt dump.dmp -o ./c2
 memdump-toolkit config malware.dll -o ./config
 memdump-toolkit config dump.dmp --dump -o ./config
 
+# Regenerate HTML report from existing results
+memdump-toolkit report ./results
+
 # Fetch community YARA rulesets
 memdump-toolkit fetch-rules                     # download or update all 6 rulesets
 memdump-toolkit fetch-rules -r signature-base   # just one
@@ -139,12 +152,13 @@ memdump-toolkit fetch-rules --list              # show installed
 | **`binary_analysis.json`** | Full analysis per binary (universal + language-specific) |
 | **`iocs.csv`** | Flat IOC table (IP, URL, hash, pipe, tool) for SIEM ingestion |
 | **`executive_summary.json`** | Plain-English verdicts, MITRE ATT&CK mapping, recommended actions |
+| **`report.html`** | Interactive HTML report — dark theme, sortable tables, ATT&CK mapping (open in browser) |
 | `full_report.txt` | Human-readable report with executive summary and execution timeline |
-| `injection_report.json` | 8-check injection analysis |
+| `injection_report.json` | 9-check injection analysis |
 | `module_list.csv` | Listed module inventory (address, size, hashes, entropy) |
 | `hidden_list.csv` | Hidden PE inventory |
 | `modules/` | Extracted listed PE modules |
-| `hidden/` | Extracted hidden PE images |
+| `hidden/` | Extracted hidden PE images (includes headerless recoveries) |
 | `go_implants.json` | Go binary analysis (capabilities, packages, known tools) |
 | `go_info.json` | Structural Go metadata (buildinfo, pclntab functions, dependencies) |
 | `go_binaries/` | Extracted Go binaries |
@@ -194,6 +208,8 @@ Every module exports `analyze(mf, reader, out_dir)` (orchestrated) and `run(dump
 | High-entropy sections | +10 | Encrypted/compressed content |
 | Embedded network IOCs | +10 | URLs, named pipes in strings |
 | Timestamp anomaly | +5 | Future date, pre-2000 |
+| Headerless PE (MZ zeroed) | +25 | PE found via section table patterns, header erased |
+| Section unpacking | +15 | Large virtual/raw ratio + high entropy on executable section |
 
 ### Language-Specific Deep Analysis
 
@@ -205,18 +221,19 @@ When language is detected, the binary gets additional specialized analysis:
 
 **Rust/Delphi/Nim** — language identification via string signatures (panic handlers, compiler paths, runtime markers). Tagged in output for analyst awareness.
 
-## Injection Detection (8 Checks)
+## Injection Detection (9 Checks)
 
 | Check | What It Finds |
 |-------|--------------|
 | Typosquatting | DLL names mimicking system DLLs (Levenshtein + homoglyph) |
 | Heap-loaded modules | DLLs at heap addresses (bitness-aware) |
-| Hidden PE images | PE binaries not in the module list |
+| Hidden PE images | PE binaries not in the module list (including headerless PE recovery) |
 | Untrusted paths | Modules loaded from non-system locations |
 | Duplicate names | Multiple DLLs with the same name |
 | Rogue threads | Threads executing outside known modules |
 | Executable memory | RWX and RX regions with 7-heuristic shellcode analysis (prologues, patterns, NOP sleds, code density, embedded PEs, statistical classification, capstone disassembly) |
 | Suspicious imports | API combinations used for injection/evasion |
+| Stack frame walking | Return addresses outside known modules (catches shellcode callers) |
 
 ## Binary Inspection (`inspect`)
 
@@ -226,7 +243,7 @@ Analyze any standalone binary file — auto-detects the language and dispatches 
 memdump-toolkit inspect malware.dll -o ./results
 ```
 
-Detection order: Go (structural `\xff Go buildinf:` magic) → .NET (CLR header) → Rust/Delphi/Nim (byte signatures) → Native fallback. Always runs YARA if `--yara-rules` is provided.
+Detection order: Go (structural `\xff Go buildinf:` magic) → .NET (CLR header) → Rust/Delphi/Nim (byte signatures) → Native fallback. Always runs YARA if `--yara` or `--yara-rules` is provided.
 
 ## C2 Hunt (`c2-hunt`)
 
@@ -259,17 +276,17 @@ Extracts module path, Go version, dependencies from `\xff Go buildinf:` marker. 
 ## YARA Integration
 
 ```bash
-# One-time setup: fetch community rulesets to ~/.memdump-toolkit/rules/
-memdump-toolkit fetch-rules
+# Use community rules (auto-downloaded)
+memdump-toolkit full dump.dmp -o ./results --yara
 
-# Every analysis — just add --yara-rules (auto-discovers fetched rules)
-memdump-toolkit full dump.dmp -o ./results --yara-rules auto
+# Update community rules, then scan
+memdump-toolkit full dump.dmp -o ./results --update-yara --yara
 
-# Or point to a specific directory
+# Use a custom rules directory
 memdump-toolkit full dump.dmp --yara-rules ./my-custom-rules/
 ```
 
-**YARA is the sole detection engine for offensive tool attribution.** The toolkit does not ship built-in signatures for tools like Cobalt Strike or Metasploit — use `--yara-rules` with a community ruleset for tool identification.
+**The toolkit uses a two-tier detection approach.** Built-in Python signatures (`SHELLCODE_PROLOGUES`, `KNOWN_TOOLS`, `PACKER_SIGNATURES`, etc.) provide fast first-pass detection for common patterns. YARA scanning (via `--yara` or `--yara-rules`) adds deeper offensive tool attribution — matching Cobalt Strike, Metasploit, custom implants, and other advanced signatures for maximum coverage.
 
 `fetch-rules` downloads these rulesets (all by default, or pick with `-r`):
 
@@ -282,6 +299,12 @@ memdump-toolkit full dump.dmp --yara-rules ./my-custom-rules/
 | **eset** | ESET research publications |
 | **elastic** | Elastic threat research |
 
+Rulesets are configured in `~/.memdump-toolkit/rulesets.yml` — edit this file to add custom repositories or remove defaults without code changes.
+
+## Known Limitations
+
+See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for a detailed breakdown of what the toolkit cannot do, where detection has gaps, and what constraints are inherent to offline minidump analysis.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -290,9 +313,9 @@ memdump-toolkit full dump.dmp --yara-rules ./my-custom-rules/
 | "No modules found" | Dump may lack module list — hidden PE scan still runs |
 | "YARA scan failed" | `uv sync --extra yara` + check rule syntax |
 | "Failed to read module memory" | Dump truncated — toolkit falls back to page-by-page reading |
-| Slow on large dumps | Normal for >1 GB; dump is parsed once, modules are filtered by tier |
+| Slow on large dumps | Normal for >1 GB; dump is parsed once, binary analysis runs in parallel, modules are filtered by tier |
 | Too many false positives | System DLLs should score 0 — check if paths are in trusted list |
-| Hashes don't match VirusTotal/NSRL | **Expected.** Memory-dumped DLLs differ from on-disk originals due to relocation, IAT patching, and page zeroing. See [Architecture § Why memory-dumped hashes don't match](docs/ARCHITECTURE.md#why-memory-dumped-hashes-dont-match-on-disk-files). Use `--known-good` with memory-image hash sets instead. |
+| Hashes don't match VirusTotal | **Expected.** Memory-dumped DLLs differ from on-disk originals due to relocation, IAT patching, and page zeroing — hashes will never match VirusTotal or any on-disk database. |
 
 ## Acknowledgements
 

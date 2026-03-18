@@ -27,42 +27,57 @@ from minidump.minidumpfile import MinidumpFile
 
 from memdump_toolkit.constants import (
     IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_RWX, IMAGE_SCN_MEM_WRITE,
-    LANG_SIGNATURES, MAX_SCAN_SIZE, PACKER_SIGNATURES, TRUSTED_PATH_FRAGMENTS,
+    LANG_SIGNATURES, PACKER_SIGNATURES,
     TIMESTAMP_EPOCH_ZERO, TIMESTAMP_EPOCH_MAX,
     TIMESTAMP_YEAR_MIN, TIMESTAMP_YEAR_MAX,
+    UNPACK_VSIZE_RATIO_THRESHOLD, UNPACK_MIN_SECTION_SIZE, UNPACK_ENTROPY_THRESHOLD,
 )
 from memdump_toolkit.pe_utils import (
     compute_hashes, extract_imports, get_pe_info, is_trusted_path,
     logger, scan_with_yara, severity_label, setup_logging, write_csv,
 )
 
-def load_known_good_hashes(path: str) -> set[str]:
-    """Load SHA-256 hashes from a file (one hex digest per line).
 
-    Supports NSRL RDS format (SHA-256 in first column, comma-separated)
-    and plain text (one hash per line). Lines starting with # are skipped.
-    Returns the set of loaded hashes.
+# ─── Parallel Analysis ──────────────────────────────────────────────────────
+
+# Worker state — initialized once per process via ProcessPoolExecutor initializer
+_worker_yara_dir: str | None = None
+
+
+def _init_worker(yara_dir: str | None) -> None:
+    """Initialize worker process state (called once per worker by ProcessPoolExecutor)."""
+    global _worker_yara_dir
+    _worker_yara_dir = yara_dir
+
+
+def _analyze_file_worker(args: tuple[str, str]) -> dict[str, Any] | None:
+    """Analyze a single binary file in a worker process.
+
+    Args:
+        args: (filepath, source) tuple — must be a single arg for Pool.map().
+
+    Returns:
+        Analysis result dict, or None if file is unreadable/too small.
     """
-    known_good: set[str] = set()
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            # NSRL CSV: "SHA-256","MD5","CRC32","FileName",...
-            # Skip header row (contains alphabetic column names)
-            if line.startswith('"SHA') or line.startswith('"sha'):
-                continue
-            # Plain text: just the hash; CSV: first field
-            token = line.split(",")[0].strip('" ').lower()
-            if len(token) == 64:
-                try:
-                    int(token, 16)  # validate hex
-                    known_good.add(token)
-                except ValueError:
-                    continue
-    logger.info("Loaded %d known-good hashes from %s", len(known_good), path)
-    return known_good
+    filepath, source = args
+    try:
+        fsize = os.path.getsize(filepath)
+        if fsize < 0x200:
+            return None
+        with open(filepath, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None
+
+    result = analyze_single_binary(
+        filepath, data, source=source,
+        yara_rules_dir=_worker_yara_dir,
+    )
+
+    if not result.get("is_pe", False):
+        return None
+
+    return result
 
 
 # ─── Classification ──────────────────────────────────────────────────────────
@@ -149,7 +164,7 @@ def detect_packer_artifacts(data: bytes, sections: list[dict]) -> list[dict]:
     return found
 
 
-def detect_section_anomalies(sections: list[dict]) -> list[dict]:
+def detect_section_anomalies(sections: list[dict], section_entropies: list[dict] | None = None) -> list[dict]:
     """Detect suspicious section characteristics."""
     anomalies: list[dict] = []
 
@@ -196,6 +211,26 @@ def detect_section_anomalies(sections: list[dict]) -> list[dict]:
                 "detail": "Zero-size executable section",
             })
 
+        # Section unpacking: large virtual_size vs tiny raw_size + high entropy
+        raw_size = sec.get("raw_size", 0)
+        if (raw_size > 0
+                and vsize > 0
+                and vsize >= UNPACK_MIN_SECTION_SIZE
+                and vsize / raw_size >= UNPACK_VSIZE_RATIO_THRESHOLD
+                and (chars & IMAGE_SCN_MEM_EXECUTE)):
+            # Check entropy if available
+            ent = 0.0
+            if section_entropies:
+                for se in section_entropies:
+                    if se["name"] == name:
+                        ent = se.get("entropy", 0.0)
+                        break
+            if ent >= UNPACK_ENTROPY_THRESHOLD:
+                anomalies.append({
+                    "section": name, "type": "unpacked",
+                    "detail": f"Likely runtime-unpacked: vsize/rsize={vsize/raw_size:.0f}x, entropy={ent:.1f}",
+                })
+
     return anomalies
 
 
@@ -239,7 +274,6 @@ def _get_analysis_tier(filepath: str, source: str) -> int:
 def analyze_single_binary(
     filepath: str, data: bytes, source: str = "unknown",
     yara_rules_dir: str | None = None,
-    known_good: set[str] | None = None,
 ) -> dict[str, Any]:
     """Run universal analysis on a single PE binary.
 
@@ -300,7 +334,7 @@ def analyze_single_binary(
 
     if tier == 1:
         # Lightweight: stop here for trusted modules
-        result["risk_score"], result["risk_factors"] = compute_risk_score(result, known_good)
+        result["risk_score"], result["risk_factors"] = compute_risk_score(result)
         return result
 
     # ─── Tier 2: Full analysis ───────────────────────────────────────
@@ -313,7 +347,7 @@ def analyze_single_binary(
     result["imported_dlls"] = sorted(imports.keys())
 
     # Section anomalies
-    section_anomalies = detect_section_anomalies(sections)
+    section_anomalies = detect_section_anomalies(sections, pe_info.get("section_entropy"))
     if section_anomalies:
         result["section_anomalies"] = section_anomalies
 
@@ -395,17 +429,14 @@ def analyze_single_binary(
                 result["offensive_tools"] = offensive_tools
 
     # ─── Composite risk score ────────────────────────────────────────
-    result["risk_score"], result["risk_factors"] = compute_risk_score(result, known_good)
+    result["risk_score"], result["risk_factors"] = compute_risk_score(result)
 
     return result
 
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
-def compute_risk_score(
-    result: dict,
-    known_good: set[str] | None = None,
-) -> tuple[int, list[str]]:
+def compute_risk_score(result: dict) -> tuple[int, list[str]]:
     """Compute composite risk score (0-100) with human-readable factors."""
     score = 0
     factors: list[str] = []
@@ -483,6 +514,11 @@ def compute_risk_score(
         score += 15
         factors.append(f"rwx_sections({len(rwx)})")
 
+    unpacked = [a for a in anomalies if a["type"] == "unpacked"]
+    if unpacked:
+        score += 15
+        factors.append(f"section_unpacking({len(unpacked)})")
+
     # High entropy sections
     if result.get("high_entropy_sections"):
         score += 10
@@ -494,19 +530,17 @@ def compute_risk_score(
         score += 5
         factors.append(f"timestamp_{ts_anomaly}")
 
+    # Headerless PE (MZ header zeroed — strong evasion indicator)
+    if result.get("source") == "hidden" and "headerless" in str(result.get("file", "")):
+        score += 25
+        factors.append("headerless_pe")
+
     # Config extraction found IOCs
     config = result.get("config", {})
     net = config.get("network", {})
     if net.get("urls") or net.get("named_pipes"):
         score += 10
         factors.append("embedded_network_iocs")
-
-    # Known-good (NSRL) hash match — strong de-prioritization
-    sha = result.get("hashes", {}).get("sha256", "")
-    if sha and known_good and sha.lower() in known_good:
-        score = max(score - 50, 0)
-        factors.append("KNOWN_GOOD_HASH")
-        result["known_good"] = True
 
     return min(score, 100), factors
 
@@ -627,18 +661,17 @@ def _print_report(results: list[dict]) -> None:
 def analyze(
     mf: Any, reader: Any, out_dir: str,
     yara_rules_dir: str | None = None,
-    known_good: set[str] | None = None,
 ) -> list[dict]:
     """Orchestrator entry point — analyze all extracted binaries from a dump.
 
     Expects extract_dlls.analyze() to have already run, producing
     out_dir/modules/ and out_dir/hidden/ directories.
+
+    Uses ProcessPoolExecutor for parallel analysis when multiple binaries
+    are present. Falls back to sequential on failure.
     """
-    results: list[dict] = []
-    seen_hashes: set[str] = set()  # deduplicate by SHA256
-    total = 0
-    skipped_tier0 = 0
-    skipped_trusted = 0
+    # ─── Collect all files to analyze ─────────────────────────────────
+    file_tasks: list[tuple[str, str]] = []  # (filepath, source)
 
     dirs_to_scan = [
         (os.path.join(out_dir, "modules"), "listed"),
@@ -648,56 +681,76 @@ def analyze(
     for scan_dir, source in dirs_to_scan:
         if not os.path.isdir(scan_dir):
             continue
-
-        files = sorted(os.listdir(scan_dir))
-        logger.info(f"Scanning {len(files)} {source} binaries...")
-
-        for fname in files:
+        for fname in sorted(os.listdir(scan_dir)):
             fpath = os.path.join(scan_dir, fname)
-            if not os.path.isfile(fpath):
+            if os.path.isfile(fpath):
+                file_tasks.append((fpath, source))
+
+    if not file_tasks:
+        logger.info("No binaries found to analyze.")
+        return []
+
+    logger.info(f"Analyzing {len(file_tasks)} binaries...")
+
+    # ─── Run analysis (parallel or sequential) ───────────────────────
+    raw_results: list[dict] = []
+    used_parallel = False
+
+    max_workers = min(os.cpu_count() or 1, 4)
+
+    if max_workers > 1 and len(file_tasks) >= 4:
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+            logger.info(f"  Using {max_workers} parallel workers")
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_init_worker,
+                initargs=(yara_rules_dir,),
+            ) as pool:
+                for result in pool.map(_analyze_file_worker, file_tasks):
+                    if result is not None:
+                        raw_results.append(result)
+            used_parallel = True
+        except Exception as e:
+            logger.info(f"  Parallel analysis failed ({e}), falling back to sequential")
+            raw_results = []
+
+    if not used_parallel:
+        # Set worker state in main process for sequential mode
+        _init_worker(yara_rules_dir)
+        for filepath, source in file_tasks:
+            result = _analyze_file_worker((filepath, source))
+            if result is not None:
+                raw_results.append(result)
+
+    # ─── Post-process: tier filtering + dedup ─────────────────────────
+    results: list[dict] = []
+    seen_hashes: set[str] = set()
+    skipped_tier0 = 0
+    skipped_trusted = 0
+
+    for result in raw_results:
+        # Tier 0 skip
+        if result.get("tier") == 0:
+            skipped_tier0 += 1
+            continue
+
+        # Deduplicate by SHA-256
+        sha = result.get("hashes", {}).get("sha256", "")
+        if sha in seen_hashes:
+            continue
+        if sha:
+            seen_hashes.add(sha)
+
+        # Tier 1: only keep if risk >= 10
+        if result.get("tier") == 1:
+            if result.get("risk_score", 0) < 10:
+                skipped_trusted += 1
                 continue
-            fsize = os.path.getsize(fpath)
-            if fsize < 0x200:  # Too small for valid PE
-                continue
 
-            total += 1
+        results.append(result)
 
-            try:
-                with open(fpath, "rb") as f:
-                    data = f.read()
-            except Exception as e:
-                logger.warning("Failed to analyze module '%s': %s", fname, e)
-                continue
-
-            result = analyze_single_binary(
-                fpath, data, source=source,
-                yara_rules_dir=yara_rules_dir,
-                known_good=known_good,
-            )
-
-            if not result.get("is_pe", False):
-                continue
-
-            # Tier 0 skip
-            if result.get("tier") == 0:
-                skipped_tier0 += 1
-                continue
-
-            # Deduplicate
-            sha = result.get("hashes", {}).get("sha256", "")
-            if sha in seen_hashes:
-                continue
-            if sha:
-                seen_hashes.add(sha)
-
-            if result.get("tier") == 1:
-                # Still record if it has anomalies
-                if result.get("risk_score", 0) < 10:
-                    skipped_trusted += 1
-                    continue
-
-            results.append(result)
-
+    total = len(file_tasks)
     logger.info(f"\nAnalyzed {total} binaries:")
     logger.info(f"  {skipped_tier0} resource-only (skipped)")
     logger.info(f"  {skipped_trusted} trusted (lightweight check)")
@@ -741,7 +794,6 @@ def analyze(
 def run(
     dump_path: str, out_dir: str | None = None,
     verbose: bool = False, yara_rules_dir: str | None = None,
-    known_good: set[str] | None = None,
 ) -> list[dict]:
     """Standalone entry point — extracts DLLs first, then analyzes all."""
     setup_logging(verbose)
@@ -761,4 +813,4 @@ def run(
 
     # Step 2: Universal analysis
     print("\nRunning universal binary analysis...")
-    return analyze(mf, reader, out_dir, yara_rules_dir, known_good)
+    return analyze(mf, reader, out_dir, yara_rules_dir)
